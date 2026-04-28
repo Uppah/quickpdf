@@ -41,6 +41,9 @@ pub enum ParsedValue {
     /// 100..900 normalized; "normal" → 400, "bold" → 700.
     Weight(u16),
     TextAlign(TextAlign),
+    /// Opaque sRGB colour. Alpha is dropped at parse time (Phase 1.7a is
+    /// opaque-only; transparency lands with the box-model paint pass).
+    Color(Color),
 }
 
 /// CSS `text-align` keyword. Phase 1.6 supports `left`, `center`, `right`.
@@ -51,10 +54,26 @@ pub enum TextAlign {
     Right,
 }
 
+/// 8-bit-per-channel sRGB colour. Phase 1.7a only models opaque colours;
+/// `rgba(...)`'s alpha is parsed and discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    pub const BLACK: Color = Color { r: 0, g: 0, b: 0 };
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b }
+    }
+}
+
 /// Apply CSS declarations to a UA-default `BlockStyle`. Declarations are
-/// applied in source order; the last value for any property wins (full
-/// specificity is Phase 1.6c). Unknown properties and unparseable values
-/// are silently ignored.
+/// applied in source order; the last value for any property wins. Unknown
+/// properties and unparseable values are silently ignored.
 pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle {
     let mut out = base;
     for decl in decls {
@@ -67,6 +86,7 @@ pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle
             ("margin-top", ParsedValue::LengthEm(x)) => out.margin_top_em = x,
             ("margin-bottom", ParsedValue::LengthEm(x)) => out.margin_bottom_em = x,
             ("text-align", ParsedValue::TextAlign(a)) => out.text_align = a,
+            ("color", ParsedValue::Color(c)) => out.color = c,
             // Property/value-shape mismatch (e.g. `font-size: bold`) — ignore.
             _ => {}
         }
@@ -84,6 +104,7 @@ pub fn parse_value(prop: &str, value: &str) -> Option<ParsedValue> {
         }
         "font-weight" => parse_weight(value).map(ParsedValue::Weight),
         "text-align" => parse_text_align(value).map(ParsedValue::TextAlign),
+        "color" => parse_color(value).map(ParsedValue::Color),
         _ => None,
     }
 }
@@ -135,6 +156,114 @@ fn parse_text_align(value: &str) -> Option<TextAlign> {
     }
 }
 
+/// Parse a CSS colour value into an opaque `Color`. Supported forms:
+///
+/// - 17 named colours (the 16 HTML 4 basics + `transparent`, which becomes
+///   `Color::BLACK` since Phase 1.7a is opaque-only).
+/// - `#rgb` and `#rrggbb` hex.
+/// - `rgb(r, g, b)` and `rgba(r, g, b, a)` — alpha is parsed and discarded.
+///   Components may be integers (0–255) or percentages (0%–100%).
+///
+/// Anything else (`hsl()`, `currentColor`, `color-mix()`, named extras
+/// like `rebeccapurple`) returns `None` and the cascade falls through.
+pub fn parse_color(value: &str) -> Option<Color> {
+    let v = value.trim();
+    if let Some(c) = parse_named_color(v) {
+        return Some(c);
+    }
+    if let Some(rest) = v.strip_prefix('#') {
+        return parse_hex_color(rest);
+    }
+    if let Some(args) = v.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+        return parse_rgb_args(args, false);
+    }
+    if let Some(args) = v.strip_prefix("rgba(").and_then(|s| s.strip_suffix(')')) {
+        return parse_rgb_args(args, true);
+    }
+    None
+}
+
+fn parse_named_color(name: &str) -> Option<Color> {
+    let n = name.to_ascii_lowercase();
+    let c = match n.as_str() {
+        "black" => Color::rgb(0, 0, 0),
+        "silver" => Color::rgb(192, 192, 192),
+        "gray" | "grey" => Color::rgb(128, 128, 128),
+        "white" => Color::rgb(255, 255, 255),
+        "maroon" => Color::rgb(128, 0, 0),
+        "red" => Color::rgb(255, 0, 0),
+        "purple" => Color::rgb(128, 0, 128),
+        "fuchsia" | "magenta" => Color::rgb(255, 0, 255),
+        "green" => Color::rgb(0, 128, 0),
+        "lime" => Color::rgb(0, 255, 0),
+        "olive" => Color::rgb(128, 128, 0),
+        "yellow" => Color::rgb(255, 255, 0),
+        "navy" => Color::rgb(0, 0, 128),
+        "blue" => Color::rgb(0, 0, 255),
+        "teal" => Color::rgb(0, 128, 128),
+        "aqua" | "cyan" => Color::rgb(0, 255, 255),
+        "transparent" => Color::BLACK,
+        _ => return None,
+    };
+    Some(c)
+}
+
+fn parse_hex_color(rest: &str) -> Option<Color> {
+    let is_hex = |b: u8| b.is_ascii_hexdigit();
+    let bytes = rest.as_bytes();
+    match bytes.len() {
+        3 if bytes.iter().all(|b| is_hex(*b)) => {
+            // #rgb → expand each nibble: r → rr, g → gg, b → bb.
+            let r = u8::from_str_radix(&rest[0..1], 16).ok()?;
+            let g = u8::from_str_radix(&rest[1..2], 16).ok()?;
+            let b = u8::from_str_radix(&rest[2..3], 16).ok()?;
+            Some(Color::rgb(r * 17, g * 17, b * 17))
+        }
+        6 if bytes.iter().all(|b| is_hex(*b)) => {
+            let r = u8::from_str_radix(&rest[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&rest[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&rest[4..6], 16).ok()?;
+            Some(Color::rgb(r, g, b))
+        }
+        _ => None,
+    }
+}
+
+fn parse_rgb_args(args: &str, expect_alpha: bool) -> Option<Color> {
+    let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+    let needed = if expect_alpha { 4 } else { 3 };
+    if parts.len() != needed {
+        return None;
+    }
+    let r = parse_rgb_component(parts[0])?;
+    let g = parse_rgb_component(parts[1])?;
+    let b = parse_rgb_component(parts[2])?;
+    if expect_alpha {
+        // Validate alpha but discard it.
+        let alpha: f32 = parts[3].parse().ok()?;
+        if !(0.0..=1.0).contains(&alpha) {
+            return None;
+        }
+    }
+    Some(Color::rgb(r, g, b))
+}
+
+fn parse_rgb_component(raw: &str) -> Option<u8> {
+    if let Some(pct) = raw.strip_suffix('%') {
+        let n: f32 = pct.trim().parse().ok()?;
+        if !(0.0..=100.0).contains(&n) {
+            return None;
+        }
+        Some((n * 255.0 / 100.0).round() as u8)
+    } else {
+        let n: i32 = raw.parse().ok()?;
+        if !(0..=255).contains(&n) {
+            return None;
+        }
+        Some(n as u8)
+    }
+}
+
 /// Builder that tracks **which** `BlockStyle` fields were explicitly set
 /// by author rules, so inheritance can fill in the un-set ones from a
 /// parent's resolved `BlockStyle`.
@@ -142,6 +271,7 @@ fn parse_text_align(value: &str) -> Option<TextAlign> {
 /// Inherited properties (CSS) — fall back to parent if `None`:
 /// - `font_size_em`
 /// - `text_align`
+/// - `color`
 ///
 /// Non-inherited properties — fall back to `BlockStyle::DEFAULT` regardless
 /// of parent:
@@ -156,6 +286,7 @@ pub struct BlockStyleBuilder {
     pub margin_bottom_em: Option<f32>,
     pub indent_em: Option<f32>,
     pub text_align: Option<TextAlign>,
+    pub color: Option<Color>,
 }
 
 impl BlockStyleBuilder {
@@ -171,12 +302,14 @@ impl BlockStyleBuilder {
             margin_bottom_em: Some(style.margin_bottom_em),
             indent_em: Some(style.indent_em),
             text_align: Some(style.text_align),
+            color: Some(style.color),
         }
     }
 
     /// Finalise into a `BlockStyle`. Inherited fields (`font_size_em`,
-    /// `text_align`) fall back to `parent` if `Some`, else `BlockStyle::DEFAULT`.
-    /// Non-inherited fields always fall back to `BlockStyle::DEFAULT`.
+    /// `text_align`, `color`) fall back to `parent` if `Some`, else
+    /// `BlockStyle::DEFAULT`. Non-inherited fields always fall back to
+    /// `BlockStyle::DEFAULT`.
     pub fn build(self, parent: Option<&BlockStyle>) -> BlockStyle {
         let def = BlockStyle::DEFAULT;
         BlockStyle {
@@ -188,13 +321,16 @@ impl BlockStyleBuilder {
             indent_em: self.indent_em.unwrap_or(def.indent_em),
             text_align: self.text_align.unwrap_or_else(||
                 parent.map(|p| p.text_align).unwrap_or(def.text_align)),
+            color: self.color.unwrap_or_else(||
+                parent.map(|p| p.color).unwrap_or(def.color)),
         }
     }
 }
 
 /// Transitional inheritance helper. Per-field, if `child` equals
 /// `BlockStyle::DEFAULT` for that field, take `parent`'s value;
-/// otherwise keep child's. Only `font_size_em` and `text_align` participate.
+/// otherwise keep child's. `font_size_em`, `text_align`, and `color`
+/// participate.
 pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
     let def = BlockStyle::DEFAULT;
     BlockStyle {
@@ -211,6 +347,11 @@ pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
             parent.text_align
         } else {
             child.text_align
+        },
+        color: if child.color == def.color {
+            parent.color
+        } else {
+            child.color
         },
     }
 }
@@ -398,6 +539,7 @@ mod tests {
             margin_bottom_em: 0.75,
             indent_em: 1.5,
             text_align: TextAlign::Right,
+            color: Color::rgb(10, 20, 30),
         };
         let b = BlockStyleBuilder::from_block(original);
         // No parent — every field should round-trip from the builder.
@@ -408,6 +550,7 @@ mod tests {
         assert_eq!(s.margin_bottom_em, original.margin_bottom_em);
         assert_eq!(s.indent_em, original.indent_em);
         assert_eq!(s.text_align, original.text_align);
+        assert_eq!(s.color, original.color);
     }
 
     #[test]
@@ -433,6 +576,106 @@ mod tests {
         };
         let s = inherit(&parent, child);
         assert_eq!(s.font_size_em, 0.5);
+    }
+
+    // ---- Phase 1.7a: colour parsing + cascade + inheritance.
+
+    #[test]
+    fn parse_color_named() {
+        assert_eq!(parse_color("red"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color("BLACK"), Some(Color::BLACK));
+        assert_eq!(parse_color("white"), Some(Color::rgb(255, 255, 255)));
+        assert_eq!(parse_color("gray"), Some(Color::rgb(128, 128, 128)));
+        assert_eq!(parse_color("grey"), Some(Color::rgb(128, 128, 128)));
+        assert_eq!(parse_color("cyan"), Some(Color::rgb(0, 255, 255)));
+        assert_eq!(parse_color("aqua"), Some(Color::rgb(0, 255, 255)));
+        assert_eq!(parse_color("rebeccapurple"), None);
+        assert_eq!(parse_color("transparent"), Some(Color::BLACK));
+    }
+
+    #[test]
+    fn parse_color_hex() {
+        assert_eq!(parse_color("#000000"), Some(Color::BLACK));
+        assert_eq!(parse_color("#ffffff"), Some(Color::rgb(255, 255, 255)));
+        assert_eq!(parse_color("#FFFFFF"), Some(Color::rgb(255, 255, 255)));
+        assert_eq!(parse_color("#abc"), Some(Color::rgb(0xaa, 0xbb, 0xcc)));
+        assert_eq!(parse_color("#1a2b3c"), Some(Color::rgb(0x1a, 0x2b, 0x3c)));
+        assert_eq!(parse_color("#xyz"), None);
+        assert_eq!(parse_color("#12345"), None); // not 3 or 6
+        assert_eq!(parse_color("#1234567"), None);
+    }
+
+    #[test]
+    fn parse_color_rgb_function() {
+        assert_eq!(parse_color("rgb(255, 0, 0)"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(parse_color("rgb(0,128,255)"), Some(Color::rgb(0, 128, 255)));
+        assert_eq!(parse_color("rgb(100%, 0%, 50%)"),
+            Some(Color::rgb(255, 0, 128)));
+        assert_eq!(parse_color("rgb(256, 0, 0)"), None); // out of range
+        assert_eq!(parse_color("rgb(0, 0)"), None); // wrong arity
+    }
+
+    #[test]
+    fn parse_color_rgba_drops_alpha() {
+        assert_eq!(
+            parse_color("rgba(255, 0, 0, 0.5)"),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            parse_color("rgba(10, 20, 30, 0)"),
+            Some(Color::rgb(10, 20, 30))
+        );
+        assert_eq!(parse_color("rgba(0, 0, 0, 1.5)"), None); // alpha > 1
+    }
+
+    #[test]
+    fn apply_color_property_overrides_default() {
+        let out = apply_declarations(BlockStyle::DEFAULT, &[d("color", "#ff0000")]);
+        assert_eq!(out.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn unparseable_color_is_ignored() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[d("color", "notacolor")],
+        );
+        assert_eq!(out.color, Color::BLACK);
+    }
+
+    #[test]
+    fn builder_inherits_color_from_parent() {
+        let parent = BlockStyle {
+            color: Color::rgb(50, 100, 200),
+            ..BlockStyle::DEFAULT
+        };
+        let s = BlockStyleBuilder::new().build(Some(&parent));
+        assert_eq!(s.color, Color::rgb(50, 100, 200));
+    }
+
+    #[test]
+    fn inherit_helper_takes_parent_color_when_child_is_default() {
+        let parent = BlockStyle {
+            color: Color::rgb(255, 0, 0),
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle::DEFAULT;
+        let s = inherit(&parent, child);
+        assert_eq!(s.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn inherit_helper_keeps_child_color_when_set() {
+        let parent = BlockStyle {
+            color: Color::rgb(255, 0, 0),
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle {
+            color: Color::rgb(0, 255, 0),
+            ..BlockStyle::DEFAULT
+        };
+        let s = inherit(&parent, child);
+        assert_eq!(s.color, Color::rgb(0, 255, 0));
     }
 
     #[test]

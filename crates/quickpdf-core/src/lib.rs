@@ -13,9 +13,13 @@ pub use parse::Document as ParsedDocument;
 use krilla::Document;
 use krilla::SerializeSettings;
 use krilla::geom::{Point, Size};
+use krilla::color::rgb as krilla_rgb;
+use krilla::paint::Fill;
 use krilla::page::PageSettings;
 use krilla::text::{Font, TextDirection};
 use thiserror::Error;
+
+use crate::style::Color;
 
 /// A4 page size in PDF points (1pt = 1/72 in; 595×842 ≈ 210×297 mm).
 pub const A4_WIDTH_PT: f32 = 595.0;
@@ -72,13 +76,15 @@ const DEFAULT_LINE_HEIGHT: f32 = 1.4;
 /// Phase 1.7 will read this from `margin-top`/`margin-bottom`.
 const PARAGRAPH_GAP_LINES: f32 = 0.5;
 
-/// One placed line ready to paint: where it goes, what to render at what size.
+/// One placed line ready to paint: where it goes, what to render at what
+/// size, and what colour.
 #[derive(Debug, Clone)]
 struct PlacedLine {
     y: f32,
     x: f32,
     font_size_pt: f32,
     text: String,
+    color: Color,
 }
 
 /// Render an HTML string to a PDF byte vector.
@@ -116,7 +122,21 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
         let mut page = document.start_page_with(PageSettings::new(size));
         {
             let mut surface = page.surface();
+            let mut current_color: Option<Color> = None;
             for line in page_lines {
+                if current_color != Some(line.color) {
+                    let fill = Fill {
+                        paint: krilla_rgb::Color::new(
+                            line.color.r,
+                            line.color.g,
+                            line.color.b,
+                        )
+                        .into(),
+                        ..Fill::default()
+                    };
+                    surface.set_fill(Some(fill));
+                    current_color = Some(line.color);
+                }
                 surface.draw_text(
                     Point::from_xy(line.x, line.y),
                     font.clone(),
@@ -204,6 +224,7 @@ fn plan_pages_styled(
                 x: para_x,
                 font_size_pt: font_size,
                 text: line,
+                color: style.color,
             });
             cursor_y = Some(final_y + line_height);
         }
@@ -403,5 +424,43 @@ mod tests {
             "anonymous para should resolve to parent's style (24pt), got {}",
             orphan.font_size_pt
         );
+    }
+
+    // ---- Phase 1.7a: text colour flows through the planner.
+
+    #[test]
+    fn color_default_is_black() {
+        let pages = plan("<p>x</p>");
+        let line = &pages[0][0];
+        assert_eq!(line.color, Color::BLACK);
+    }
+
+    #[test]
+    fn author_color_overrides_default() {
+        let pages = plan(r#"<style>p { color: #ff0000; }</style><p>x</p>"#);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert_eq!(line.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn color_inherits_from_ancestor() {
+        let pages = plan(
+            r#"<style>section { color: rgb(0, 128, 255); }</style>
+            <section><p>nested</p></section>"#,
+        );
+        let line = pages[0].iter().find(|l| l.text == "nested").unwrap();
+        assert_eq!(line.color, Color::rgb(0, 128, 255));
+    }
+
+    #[test]
+    fn anonymous_block_inherits_parent_color() {
+        // The orphan run inside <div id=wrap> picks up the id rule's color
+        // because anonymous paragraphs share the parent's element_id.
+        let pages = plan(
+            r#"<style>#wrap { color: green; }</style>
+            <div id="wrap">orphan<p>child</p></div>"#,
+        );
+        let orphan = pages[0].iter().find(|l| l.text == "orphan").unwrap();
+        assert_eq!(orphan.color, Color::rgb(0, 128, 0));
     }
 }

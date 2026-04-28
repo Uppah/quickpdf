@@ -10,7 +10,7 @@ pub mod cascade;
 pub mod matcher;
 pub mod sheet;
 
-pub use cascade::TextAlign;
+pub use cascade::{Color, TextAlign};
 
 /// Resolve the final `BlockStyle` for a paragraph element by combining
 /// UA defaults, the author cascade (with full specificity + `!important`),
@@ -90,7 +90,7 @@ fn resolve_local(
 
 /// Style hints attached to a paragraph by the user-agent stylesheet.
 /// Em-relative values are resolved against the document's base font size
-/// (Phase 1: 12pt, Phase 1.6c: from `:root { font-size: ... }`).
+/// (Phase 1: 12pt; `:root { font-size: ... }` lands later).
 #[derive(Debug, Clone, Copy)]
 pub struct BlockStyle {
     /// Font size as a multiplier of the document's base size. 1.0 = body.
@@ -107,6 +107,9 @@ pub struct BlockStyle {
     pub indent_em: f32,
     /// Horizontal alignment of inline content within the block.
     pub text_align: TextAlign,
+    /// Foreground (text) colour. Inherited per CSS spec — see
+    /// `cascade::inherit` and `BlockStyleBuilder`.
+    pub color: Color,
 }
 
 impl BlockStyle {
@@ -117,6 +120,7 @@ impl BlockStyle {
         margin_bottom_em: 0.0,
         indent_em: 0.0,
         text_align: TextAlign::Left,
+        color: Color::BLACK,
     };
 }
 

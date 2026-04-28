@@ -344,3 +344,72 @@ def test_anonymous_block_inherits_parent_style():
         f"anon paragraph should pick up parent's #wrap style "
         f"(plain={plain_lines}, styled={styled_lines})"
     )
+
+
+# --- Phase 1.7a: text colour ----------------------------------------------
+
+def _pdf_content_streams(pdf_bytes: bytes) -> str:
+    """Decompress every FlateDecode-compressed stream in the PDF and return
+    the concatenated text content. Used to grep for PDF graphics-state
+    operators like `1 0 0 rg` (set RGB fill colour) that pypdf doesn't
+    expose through `extract_text`."""
+    import re
+    import zlib
+
+    out: list[str] = []
+    pattern = re.compile(
+        rb"<<[^<>]*?/Filter /FlateDecode[^<>]*?>>\nstream\n(.*?)\nendstream",
+        re.S,
+    )
+    for m in pattern.finditer(pdf_bytes):
+        try:
+            data = zlib.decompress(m.group(1))
+        except zlib.error:
+            continue
+        try:
+            out.append(data.decode("latin-1"))
+        except UnicodeDecodeError:
+            continue
+    return "\n".join(out)
+
+
+def test_default_color_is_black():
+    pdf = quickpdf.html_to_pdf("<p>x</p>")
+    streams = _pdf_content_streams(pdf)
+    assert "0 0 0 rg" in streams, "expected black fill op in content stream"
+
+
+def test_color_property_emits_red_fill_op():
+    pdf = quickpdf.html_to_pdf("<style>p { color: #ff0000; }</style><p>x</p>")
+    streams = _pdf_content_streams(pdf)
+    assert "1 0 0 rg" in streams, "expected red fill op (1 0 0 rg) in content"
+
+
+def test_named_color_blue_emits_blue_fill_op():
+    pdf = quickpdf.html_to_pdf("<style>p { color: blue; }</style><p>x</p>")
+    streams = _pdf_content_streams(pdf)
+    assert "0 0 1 rg" in streams, "expected blue fill op (0 0 1 rg) in content"
+
+
+def test_color_inherits_from_ancestor_in_pdf():
+    pdf = quickpdf.html_to_pdf(
+        "<style>section { color: rgb(0, 128, 0); }</style>"
+        "<section><p>nested</p></section>"
+    )
+    streams = _pdf_content_streams(pdf)
+    # rgb(0, 128, 0) → 128/255 ≈ 0.50196..., krilla renders as "0.5019608" or similar
+    # We'll just assert the green channel is present (non-zero R+B would fail).
+    import re
+    matches = re.findall(r"(\S+) (\S+) (\S+) rg", streams)
+    assert matches, "no rg ops at all in content stream"
+    # At least one rg op must have R==0, G>0, B==0.
+    assert any(
+        float(r) == 0.0 and float(g) > 0.0 and float(b) == 0.0
+        for r, g, b in matches
+    ), f"expected an inherited green-only fill in {matches}"
+
+
+def test_different_colors_produce_different_pdfs():
+    red = quickpdf.html_to_pdf("<style>p{color:red;}</style><p>x</p>")
+    blue = quickpdf.html_to_pdf("<style>p{color:blue;}</style><p>x</p>")
+    assert red != blue, "red and blue PDFs must differ in bytes"
