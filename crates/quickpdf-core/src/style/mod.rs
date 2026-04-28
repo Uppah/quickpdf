@@ -110,6 +110,21 @@ pub struct BlockStyle {
     /// Foreground (text) colour. Inherited per CSS spec — see
     /// `cascade::inherit` and `BlockStyleBuilder`.
     pub color: Color,
+    /// Background colour. `None` = transparent (no fill emitted).
+    /// Non-inherited per CSS spec.
+    pub background_color: Option<Color>,
+    /// Padding on each side, in em (resolved against the block's own
+    /// font size, matching the CSS convention for em-based padding).
+    /// Non-inherited.
+    pub padding_top_em: f32,
+    pub padding_right_em: f32,
+    pub padding_bottom_em: f32,
+    pub padding_left_em: f32,
+    /// Border width in em (uniform on all sides for Phase 1.7b — per-side
+    /// borders land later). Zero means "no border, don't paint a stroke".
+    pub border_width_em: f32,
+    /// Border colour. Used only when `border_width_em > 0`.
+    pub border_color: Color,
 }
 
 impl BlockStyle {
@@ -121,6 +136,13 @@ impl BlockStyle {
         indent_em: 0.0,
         text_align: TextAlign::Left,
         color: Color::BLACK,
+        background_color: None,
+        padding_top_em: 0.0,
+        padding_right_em: 0.0,
+        padding_bottom_em: 0.0,
+        padding_left_em: 0.0,
+        border_width_em: 0.0,
+        border_color: Color::BLACK,
     };
 }
 

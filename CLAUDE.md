@@ -29,14 +29,14 @@ something genuinely new, not another browser wrapper.
 | 1.6b  |   ✓    | Inline `<style>` cascade: tag/class/id/descendant selectors; 4 properties            |
 | 1.6c  |   ✓    | Specificity, `!important`, inheritance via parent-chain walk, anonymous-block wrap   |
 | 1.7a  |   ✓    | `color` property: parser (named/hex/rgb/rgba), inherited, plumbed into krilla fill   |
-| 1.7b  |   →    | **NEXT.** `background-color` + padding + borders (PlacedBox paint pass)              |
-| 1.7c  |        | Length extensions (`rem`, padding/margin shorthand) + inline `style="..."` attribute |
+| 1.7b  |   ✓    | `background-color`, `padding-*`, `border-*` via PlacedBox paint pass                 |
+| 1.7c  |   →    | **NEXT.** Length extensions (`rem`, padding/margin shorthand) + inline `style="..."` |
 |   2   |        | Tables, images, web fonts → renders email-style HTML                                 |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf` v0.1                        |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel                                   |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS                              |
 
-**Test posture today:** 111 Rust unit tests + 32 Python integration tests, all
+**Test posture today:** 124 Rust unit tests + 37 Python integration tests, all
 green in ~0.3 s combined.
 
 ## Build + test (always)
@@ -131,28 +131,30 @@ quickpdf/
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next
   to it and **must be preserved on any redistribution**.
 
-## Next session: Phase 1.7b
+## Next session: Phase 1.7c
 
-Spec lives in `~/.claude/plans/cheerful-riding-castle.md` under "Phasing".
-Phase 1.7a (text colour) is done. Phase 1.7b is the box-model paint pass:
+Phases 1.7a (colour) and 1.7b (box-model paint: bg-color, padding, border)
+are done. Phase 1.7c adds length-parsing breadth and inline `style="..."`:
 
-1. **`background-color`.** Cascade already accepts the colour parser via
-   `cascade::parse_color` — wire `background-color` into `BlockStyle` (new
-   `Option<Color>` field; non-inherited per CSS) and `apply_declarations`.
-2. **`PlacedBox`.** Sibling of `PlacedLine` carrying `(x, y, w, h, fill,
-   stroke_color, stroke_width)`. The planner emits one box per block before
-   its text lines; the renderer paints fills/strokes via `surface.draw_path`
-   on a rectangle path.
-3. **Padding.** Add `padding_{top,right,bottom,left}_em` to `BlockStyle`
-   and to the planner: padding shifts text-line origins inward and grows
-   the `PlacedBox`. Note that `inherit` does NOT touch padding (matches
-   CSS).
-4. **Borders.** `border-width`, `border-color`, `border-style` (only
-   `solid` for 1.7b — `dashed`/`dotted` later). Single-shorthand
-   `border` parses width + style + color in any order.
+1. **`rem` units.** `parse_length_em` currently knows `px`/`pt`/`em`/`%`;
+   add `rem` resolved against the document's root font-size. Phase 1.7c
+   can hard-code root = 1em until a proper `:root` cascade lands.
+2. **Padding/margin shorthand.** `padding: 10px` (one value) → all sides;
+   `padding: 10px 20px` → top/bottom + left/right; `padding: 10px 20px
+   30px` → top + L/R + bottom; `padding: 10px 20px 30px 40px` → t/r/b/l.
+   Same for `margin`. Implementation note: a shorthand expands into the
+   four longhand declarations at parse time so the cascade stays uniform.
+3. **`border` shorthand.** `border: 1px solid red` parses width + style
+   + colour in any order, expands to the three longhands.
+4. **Inline `style="..."` attribute.** Walk the DOM in `parse.rs`, harvest
+   each element's `style` attr, return a list of `(NodeId, declarations)`.
+   The integrator threads them into `style::resolve` with specificity
+   bumped to a fourth bucket (1, 0, 0, 0) — extend `Specificity` to
+   `(u32, u32, u32, u32)` (a, b, c, d) where `a = inline-style count`.
 
-Phase 1.7c then adds length extensions (`rem`, shorthand 1–4 value parsing
-for padding/margin) and inline `style="..."` attribute support.
+Known 1.7b limitation worth fixing later: a decorated block taller than
+a single page falls back to streaming-without-box. Phase 4 adds proper
+per-page-fragment box paint.
 
 ## Phase 1.6 parallel-sprint pattern (proven, repeat for 1.7)
 

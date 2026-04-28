@@ -41,9 +41,23 @@ pub enum ParsedValue {
     /// 100..900 normalized; "normal" → 400, "bold" → 700.
     Weight(u16),
     TextAlign(TextAlign),
-    /// Opaque sRGB colour. Alpha is dropped at parse time (Phase 1.7a is
-    /// opaque-only; transparency lands with the box-model paint pass).
+    /// Opaque sRGB colour.
     Color(Color),
+    /// Optional sRGB colour — `Some(c)` for a real colour, `None` for the
+    /// CSS `transparent` keyword (Phase 1.7b uses this for `background-color`
+    /// where transparency is the default and meaningful).
+    OptionalColor(Option<Color>),
+    /// CSS `border-style` keyword — `solid` is the only style we honour;
+    /// `none`/`hidden` produce `BorderStyle::None`. Anything else is ignored.
+    BorderStyle(BorderStyle),
+}
+
+/// CSS `border-style` keyword. Phase 1.7b only models presence/absence;
+/// `dashed`/`dotted`/`double` etc. land later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    None,
+    Solid,
 }
 
 /// CSS `text-align` keyword. Phase 1.6 supports `left`, `center`, `right`.
@@ -87,6 +101,20 @@ pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle
             ("margin-bottom", ParsedValue::LengthEm(x)) => out.margin_bottom_em = x,
             ("text-align", ParsedValue::TextAlign(a)) => out.text_align = a,
             ("color", ParsedValue::Color(c)) => out.color = c,
+            ("background-color", ParsedValue::OptionalColor(c)) => {
+                out.background_color = c;
+            }
+            ("padding-top", ParsedValue::LengthEm(x)) => out.padding_top_em = x,
+            ("padding-right", ParsedValue::LengthEm(x)) => out.padding_right_em = x,
+            ("padding-bottom", ParsedValue::LengthEm(x)) => out.padding_bottom_em = x,
+            ("padding-left", ParsedValue::LengthEm(x)) => out.padding_left_em = x,
+            ("border-width", ParsedValue::LengthEm(x)) => out.border_width_em = x,
+            ("border-color", ParsedValue::Color(c)) => out.border_color = c,
+            ("border-style", ParsedValue::BorderStyle(s)) => {
+                if s == BorderStyle::None {
+                    out.border_width_em = 0.0;
+                }
+            }
             // Property/value-shape mismatch (e.g. `font-size: bold`) — ignore.
             _ => {}
         }
@@ -99,12 +127,41 @@ pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle
 pub fn parse_value(prop: &str, value: &str) -> Option<ParsedValue> {
     let value = value.trim();
     match prop {
-        "font-size" | "margin-top" | "margin-bottom" => {
-            parse_length_em(value).map(ParsedValue::LengthEm)
-        }
+        "font-size"
+        | "margin-top"
+        | "margin-bottom"
+        | "padding-top"
+        | "padding-right"
+        | "padding-bottom"
+        | "padding-left"
+        | "border-width" => parse_length_em(value).map(ParsedValue::LengthEm),
         "font-weight" => parse_weight(value).map(ParsedValue::Weight),
         "text-align" => parse_text_align(value).map(ParsedValue::TextAlign),
-        "color" => parse_color(value).map(ParsedValue::Color),
+        "color" | "border-color" => parse_color(value).map(ParsedValue::Color),
+        "background-color" => Some(ParsedValue::OptionalColor(
+            parse_background_color(value)?,
+        )),
+        "border-style" => parse_border_style(value).map(ParsedValue::BorderStyle),
+        _ => None,
+    }
+}
+
+/// Parse a `background-color` value. Wraps `parse_color` but treats the
+/// CSS `transparent` keyword as `Some(None)` (parsed-but-no-fill) rather
+/// than `parse_color`'s `Some(BLACK)` fallback. Returns `None` for
+/// unparseable input so the cascade leaves the existing value in place.
+fn parse_background_color(value: &str) -> Option<Option<Color>> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("transparent") {
+        return Some(None);
+    }
+    parse_color(v).map(Some)
+}
+
+fn parse_border_style(value: &str) -> Option<BorderStyle> {
+    match value {
+        "solid" => Some(BorderStyle::Solid),
+        "none" | "hidden" => Some(BorderStyle::None),
         _ => None,
     }
 }
@@ -287,6 +344,13 @@ pub struct BlockStyleBuilder {
     pub indent_em: Option<f32>,
     pub text_align: Option<TextAlign>,
     pub color: Option<Color>,
+    pub background_color: Option<Option<Color>>,
+    pub padding_top_em: Option<f32>,
+    pub padding_right_em: Option<f32>,
+    pub padding_bottom_em: Option<f32>,
+    pub padding_left_em: Option<f32>,
+    pub border_width_em: Option<f32>,
+    pub border_color: Option<Color>,
 }
 
 impl BlockStyleBuilder {
@@ -303,6 +367,13 @@ impl BlockStyleBuilder {
             indent_em: Some(style.indent_em),
             text_align: Some(style.text_align),
             color: Some(style.color),
+            background_color: Some(style.background_color),
+            padding_top_em: Some(style.padding_top_em),
+            padding_right_em: Some(style.padding_right_em),
+            padding_bottom_em: Some(style.padding_bottom_em),
+            padding_left_em: Some(style.padding_left_em),
+            border_width_em: Some(style.border_width_em),
+            border_color: Some(style.border_color),
         }
     }
 
@@ -323,6 +394,13 @@ impl BlockStyleBuilder {
                 parent.map(|p| p.text_align).unwrap_or(def.text_align)),
             color: self.color.unwrap_or_else(||
                 parent.map(|p| p.color).unwrap_or(def.color)),
+            background_color: self.background_color.unwrap_or(def.background_color),
+            padding_top_em: self.padding_top_em.unwrap_or(def.padding_top_em),
+            padding_right_em: self.padding_right_em.unwrap_or(def.padding_right_em),
+            padding_bottom_em: self.padding_bottom_em.unwrap_or(def.padding_bottom_em),
+            padding_left_em: self.padding_left_em.unwrap_or(def.padding_left_em),
+            border_width_em: self.border_width_em.unwrap_or(def.border_width_em),
+            border_color: self.border_color.unwrap_or(def.border_color),
         }
     }
 }
@@ -353,6 +431,14 @@ pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
         } else {
             child.color
         },
+        // Box-model properties are NOT inherited — pass child's through.
+        background_color: child.background_color,
+        padding_top_em: child.padding_top_em,
+        padding_right_em: child.padding_right_em,
+        padding_bottom_em: child.padding_bottom_em,
+        padding_left_em: child.padding_left_em,
+        border_width_em: child.border_width_em,
+        border_color: child.border_color,
     }
 }
 
@@ -540,6 +626,7 @@ mod tests {
             indent_em: 1.5,
             text_align: TextAlign::Right,
             color: Color::rgb(10, 20, 30),
+            ..BlockStyle::DEFAULT
         };
         let b = BlockStyleBuilder::from_block(original);
         // No parent — every field should round-trip from the builder.
@@ -676,6 +763,89 @@ mod tests {
         };
         let s = inherit(&parent, child);
         assert_eq!(s.color, Color::rgb(0, 255, 0));
+    }
+
+    // ---- Phase 1.7b: box-model properties.
+
+    #[test]
+    fn background_color_parses_to_optional_color() {
+        assert_eq!(
+            parse_value("background-color", "red"),
+            Some(ParsedValue::OptionalColor(Some(Color::rgb(255, 0, 0))))
+        );
+        assert_eq!(
+            parse_value("background-color", "transparent"),
+            Some(ParsedValue::OptionalColor(None))
+        );
+        assert_eq!(parse_value("background-color", "notacolor"), None);
+    }
+
+    #[test]
+    fn apply_background_color() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[d("background-color", "#00ff00")],
+        );
+        assert_eq!(out.background_color, Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn apply_padding_longhands() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[
+                d("padding-top", "12px"),
+                d("padding-right", "6px"),
+                d("padding-bottom", "12px"),
+                d("padding-left", "6px"),
+            ],
+        );
+        assert_eq!(out.padding_top_em, 1.0);
+        assert_eq!(out.padding_right_em, 0.5);
+        assert_eq!(out.padding_bottom_em, 1.0);
+        assert_eq!(out.padding_left_em, 0.5);
+    }
+
+    #[test]
+    fn apply_border_width_and_color() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[
+                d("border-width", "2px"),
+                d("border-color", "blue"),
+                d("border-style", "solid"),
+            ],
+        );
+        assert!((out.border_width_em - 2.0 / 12.0).abs() < 1e-6);
+        assert_eq!(out.border_color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn border_style_none_zeroes_width() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[
+                d("border-width", "5px"),
+                d("border-style", "none"),
+            ],
+        );
+        assert_eq!(out.border_width_em, 0.0);
+    }
+
+    #[test]
+    fn box_model_is_not_inherited() {
+        // background-color, padding, border are non-inherited per CSS.
+        let parent = BlockStyle {
+            background_color: Some(Color::rgb(255, 0, 0)),
+            padding_top_em: 1.0,
+            border_width_em: 0.5,
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle::DEFAULT;
+        let s = inherit(&parent, child);
+        assert_eq!(s.background_color, None);
+        assert_eq!(s.padding_top_em, 0.0);
+        assert_eq!(s.border_width_em, 0.0);
     }
 
     #[test]

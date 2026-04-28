@@ -413,3 +413,82 @@ def test_different_colors_produce_different_pdfs():
     red = quickpdf.html_to_pdf("<style>p{color:red;}</style><p>x</p>")
     blue = quickpdf.html_to_pdf("<style>p{color:blue;}</style><p>x</p>")
     assert red != blue, "red and blue PDFs must differ in bytes"
+
+
+# --- Phase 1.7b: box-model paint pass (background-color, padding, border)
+
+def test_background_color_emits_fill_rect():
+    pdf = quickpdf.html_to_pdf(
+        "<style>p { background-color: yellow; }</style><p>x</p>"
+    )
+    streams = _pdf_content_streams(pdf)
+    # Yellow fill op + a path-fill (`f`) somewhere before the text block.
+    assert "1 1 0 rg" in streams, "expected yellow fill op (1 1 0 rg)"
+    assert "\nf\n" in streams or " f\n" in streams, "expected path-fill `f` op"
+
+
+def test_no_background_emits_no_fill_rect_for_plain_p():
+    # A plain <p> with no decoration must not emit a fill rectangle. We can't
+    # easily assert a negative on the whole stream, but we can check there is
+    # no `f\n` (path-fill) operator — text glyphs are filled via `Tj`/`TJ`,
+    # not `f`.
+    pdf = quickpdf.html_to_pdf("<p>plain</p>")
+    streams = _pdf_content_streams(pdf)
+    assert "\nf\n" not in streams and " f\n" not in streams, (
+        "plain <p> must not emit a fill-path op"
+    )
+
+
+def test_border_emits_stroke_rect():
+    pdf = quickpdf.html_to_pdf(
+        "<style>p { border-width: 2px; border-color: blue; "
+        "border-style: solid; }</style><p>x</p>"
+    )
+    streams = _pdf_content_streams(pdf)
+    assert "0 0 1 RG" in streams, "expected blue stroke op (0 0 1 RG)"
+    assert "2 w" in streams, "expected stroke-width op (2 w)"
+    # Path-stroke `S` (uppercase) operator, distinct from text-end `S`.
+    assert "\nS\n" in streams or " S\n" in streams, (
+        "expected path-stroke `S` op"
+    )
+
+
+def test_padding_left_shifts_text_position():
+    plain = quickpdf.html_to_pdf("<p>x</p>")
+    padded = quickpdf.html_to_pdf(
+        "<style>p { padding-left: 24px; }</style><p>x</p>"
+    )
+    plain_streams = _pdf_content_streams(plain)
+    padded_streams = _pdf_content_streams(padded)
+    # Both end up with a `Tm` text-matrix op carrying the x position; padding
+    # must push it to the right. Pull the x out of the first `Tm` we see.
+    import re
+
+    def first_tm_x(s: str) -> float:
+        m = re.search(r"1 0 0 -1 (\S+) \S+ Tm", s)
+        assert m, f"no Tm found in {s!r}"
+        return float(m.group(1))
+
+    plain_x = first_tm_x(plain_streams)
+    padded_x = first_tm_x(padded_streams)
+    assert padded_x - plain_x > 20.0, (
+        f"padding-left:24px should add ~24pt to text x: "
+        f"plain={plain_x}, padded={padded_x}"
+    )
+
+
+def test_border_style_none_suppresses_stroke():
+    pdf = quickpdf.html_to_pdf(
+        "<style>p { border-width: 5px; border-style: none; "
+        "background-color: red; }</style><p>x</p>"
+    )
+    streams = _pdf_content_streams(pdf)
+    # bg-fill should be present...
+    assert "1 0 0 rg" in streams
+    assert "\nf\n" in streams or " f\n" in streams
+    # ...but NO stroke colour op. Embedded font subsets contain raw "RG"
+    # byte sequences, so match a proper PDF stroke-colour op only —
+    # three numeric tokens followed by RG, anchored at line breaks/start.
+    import re
+    rg_op = re.compile(r"(?:^|\n)\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+RG\b")
+    assert not rg_op.search(streams), "border-style:none must suppress RG op"

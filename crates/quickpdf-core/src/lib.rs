@@ -12,10 +12,11 @@ pub use parse::Document as ParsedDocument;
 
 use krilla::Document;
 use krilla::SerializeSettings;
-use krilla::geom::{Point, Size};
 use krilla::color::rgb as krilla_rgb;
-use krilla::paint::Fill;
+use krilla::geom::{PathBuilder, Point, Rect, Size};
+use krilla::paint::{Fill, Stroke};
 use krilla::page::PageSettings;
+use krilla::surface::Surface;
 use krilla::text::{Font, TextDirection};
 use thiserror::Error;
 
@@ -87,6 +88,34 @@ struct PlacedLine {
     color: Color,
 }
 
+/// One placed box: rectangle to paint before any text on the page.
+/// `fill` is `None` when the block has no `background-color`. `stroke`
+/// is `Some((color, width_pt))` when the block has a non-zero
+/// `border-width`. A box with neither set is never emitted.
+#[derive(Debug, Clone)]
+struct PlacedBox {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fill: Option<Color>,
+    stroke: Option<(Color, f32)>,
+}
+
+/// One page's worth of paint operations. Boxes are painted before lines
+/// so backgrounds sit behind their text content.
+#[derive(Debug, Clone, Default)]
+struct PagePlan {
+    boxes: Vec<PlacedBox>,
+    lines: Vec<PlacedLine>,
+}
+
+impl PagePlan {
+    fn is_empty(&self) -> bool {
+        self.boxes.is_empty() && self.lines.is_empty()
+    }
+}
+
 /// Render an HTML string to a PDF byte vector.
 ///
 /// Phase 1.6b: parses author `<style>` blocks and applies their declarations
@@ -118,12 +147,17 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
         bottom_limit,
     )?;
 
-    for page_lines in &pages {
+    for page_plan in &pages {
         let mut page = document.start_page_with(PageSettings::new(size));
         {
             let mut surface = page.surface();
+            // Paint background boxes first so backgrounds sit behind text.
+            for b in &page_plan.boxes {
+                paint_box(&mut surface, b);
+            }
+
             let mut current_color: Option<Color> = None;
-            for line in page_lines {
+            for line in &page_plan.lines {
                 if current_color != Some(line.color) {
                     let fill = Fill {
                         paint: krilla_rgb::Color::new(
@@ -161,10 +195,72 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
     document.finish().map_err(|e| Error::Pdf(format!("{e:?}")))
 }
 
+/// Paint a single `PlacedBox` on the given surface — fill first (if set),
+/// then stroke (if set). Each operation builds its own rectangle path so
+/// fill and stroke can use independent paint state without interfering.
+fn paint_box(surface: &mut Surface, b: &PlacedBox) {
+    if let Some(c) = b.fill {
+        let Some(rect) = Rect::from_xywh(b.x, b.y, b.w, b.h) else {
+            return;
+        };
+        let mut pb = PathBuilder::new();
+        pb.push_rect(rect);
+        let Some(path) = pb.finish() else {
+            return;
+        };
+        surface.set_stroke(None);
+        surface.set_fill(Some(Fill {
+            paint: krilla_rgb::Color::new(c.r, c.g, c.b).into(),
+            ..Fill::default()
+        }));
+        surface.draw_path(&path);
+    }
+    if let Some((c, w)) = b.stroke {
+        // Inset the stroke rect by half the stroke width so the visible
+        // edge stays inside the box's outer dimensions (PDF strokes
+        // straddle the path).
+        let inset = w * 0.5;
+        let Some(rect) = Rect::from_xywh(
+            b.x + inset,
+            b.y + inset,
+            (b.w - w).max(0.0),
+            (b.h - w).max(0.0),
+        ) else {
+            return;
+        };
+        let mut pb = PathBuilder::new();
+        pb.push_rect(rect);
+        let Some(path) = pb.finish() else {
+            return;
+        };
+        surface.set_fill(None);
+        surface.set_stroke(Some(Stroke {
+            paint: krilla_rgb::Color::new(c.r, c.g, c.b).into(),
+            width: w,
+            ..Stroke::default()
+        }));
+        surface.draw_path(&path);
+    }
+    // Reset stroke after a box so subsequent text isn't accidentally stroked.
+    surface.set_stroke(None);
+}
+
 /// Plan page layout for tagged paragraphs. Each paragraph resolves its own
-/// `BlockStyle` (UA defaults + matching author rules), drives font size /
-/// indent / margins, and flows lines into pages, breaking at the bottom
-/// margin.
+/// `BlockStyle` (UA defaults + matching author rules), drives font size,
+/// indent, margins, padding, and box decoration, and flows lines into
+/// pages, breaking at the bottom margin.
+///
+/// Phase 1.7b box-model rules:
+///
+/// - A block with `background-color` or non-zero `border-width` is treated
+///   as a single positional unit ("paint as unit"): if it fits on the
+///   current page, the box + its lines are placed without internal
+///   pagination; if not, we try a fresh page; if it's still too tall, we
+///   fall back to streaming text without box decoration (a documented
+///   1.7b limitation — proper box pagination lands with Phase 4).
+/// - A block without decoration uses the existing line-by-line streaming
+///   path, with `padding-*` and `border-width` still shifting text origin
+///   so geometry stays consistent.
 fn plan_pages_styled(
     doc: &parse::Document,
     paragraphs: &[parse::Paragraph],
@@ -172,16 +268,15 @@ fn plan_pages_styled(
     content_width: f32,
     left_margin: f32,
     bottom_limit: f32,
-) -> Result<Vec<Vec<PlacedLine>>, Error> {
+) -> Result<Vec<PagePlan>, Error> {
     let top_baseline_for = |first_line_height: f32| MARGIN_PT + first_line_height;
+    let page_content_height = bottom_limit - MARGIN_PT;
 
-    let mut pages: Vec<Vec<PlacedLine>> = Vec::new();
-    let mut current: Vec<PlacedLine> = Vec::new();
+    let mut pages: Vec<PagePlan> = Vec::new();
+    let mut current = PagePlan::default();
     let mut cursor_y: Option<f32> = None;
 
-    for (i, para) in paragraphs.iter().enumerate() {
-        // Resolve the cascaded BlockStyle. If the element handle has somehow
-        // gone stale, fall back to UA defaults so rendering still proceeds.
+    for para in paragraphs {
         let style = match doc.element_for(para) {
             Some(elem) => style::resolve(elem, user_rules),
             None => style::ua_style(&para.tag),
@@ -189,18 +284,25 @@ fn plan_pages_styled(
         let font_size = DEFAULT_FONT_SIZE_PT * style.font_size_em;
         let line_height = font_size * DEFAULT_LINE_HEIGHT;
         let indent_pt = DEFAULT_FONT_SIZE_PT * style.indent_em;
-        let para_x = left_margin + indent_pt;
-        let para_width = (content_width - indent_pt).max(1.0);
+        let pad_top = font_size * style.padding_top_em;
+        let pad_right = font_size * style.padding_right_em;
+        let pad_bot = font_size * style.padding_bottom_em;
+        let pad_left = font_size * style.padding_left_em;
+        let border_w = font_size * style.border_width_em;
+
+        let box_left = left_margin + indent_pt;
+        let box_width = (content_width - indent_pt).max(1.0);
+        let text_x = box_left + border_w + pad_left;
+        let text_width = (box_width - 2.0 * border_w - pad_left - pad_right).max(1.0);
 
         let metrics = text::TextMetrics::new(font::FALLBACK_TTF, font_size)
             .ok_or_else(|| Error::Pdf("could not measure font at requested size".into()))?;
-        let lines = text::wrap_lines(&metrics, &para.text, para_width);
+        let lines = text::wrap_lines(&metrics, &para.text, text_width);
         if lines.is_empty() {
             continue;
         }
 
-        // Vertical spacing: top_margin from this block, plus the half-em gap
-        // we use between any two blocks (Phase 1.5 default kept as a baseline).
+        // Top margin + paragraph gap; page break if it overflows.
         let top_margin_pt = font_size * style.margin_top_em;
         if let Some(y) = cursor_y.as_mut() {
             *y += top_margin_pt + line_height * PARAGRAPH_GAP_LINES;
@@ -212,29 +314,80 @@ fn plan_pages_styled(
             cursor_y = Some(top_baseline_for(line_height));
         }
 
-        for line in lines {
-            let y = cursor_y.expect("cursor_y is set by the time we reach lines");
-            if y > bottom_limit {
+        let has_decoration = style.background_color.is_some() || border_w > 0.0;
+        let block_height_total =
+            pad_top + lines.len() as f32 * line_height + pad_bot + 2.0 * border_w;
+
+        // Try paint-as-unit if the block has visible decoration.
+        let mut box_top_for_paint: Option<f32> = None;
+        if has_decoration {
+            let candidate_top = cursor_y.unwrap() - line_height;
+            if candidate_top + block_height_total <= bottom_limit {
+                box_top_for_paint = Some(candidate_top);
+            } else if block_height_total <= page_content_height {
                 pages.push(std::mem::take(&mut current));
                 cursor_y = Some(top_baseline_for(line_height));
+                box_top_for_paint = Some(MARGIN_PT);
             }
-            let final_y = cursor_y.unwrap();
-            current.push(PlacedLine {
-                y: final_y,
-                x: para_x,
-                font_size_pt: font_size,
-                text: line,
-                color: style.color,
-            });
-            cursor_y = Some(final_y + line_height);
+            // Else: too tall to fit on any page — stream without box.
         }
 
-        // Record bottom margin so the next block's top margin can be added on.
+        if let Some(box_top) = box_top_for_paint {
+            let stroke = if border_w > 0.0 {
+                Some((style.border_color, border_w))
+            } else {
+                None
+            };
+            current.boxes.push(PlacedBox {
+                x: box_left,
+                y: box_top,
+                w: box_width,
+                h: block_height_total,
+                fill: style.background_color,
+                stroke,
+            });
+            let first_baseline = box_top + border_w + pad_top + line_height;
+            for (i, line) in lines.into_iter().enumerate() {
+                current.lines.push(PlacedLine {
+                    y: first_baseline + i as f32 * line_height,
+                    x: text_x,
+                    font_size_pt: font_size,
+                    text: line,
+                    color: style.color,
+                });
+            }
+            cursor_y = Some(box_top + block_height_total);
+        } else {
+            // Streaming path. Padding/border shift text origin; the box is
+            // not painted (either because there is none, or because the
+            // block is too tall to fit as a unit).
+            if let Some(y) = cursor_y.as_mut() {
+                *y += pad_top + border_w;
+            }
+            for line in lines {
+                let y = cursor_y.expect("cursor_y is set by the time we reach lines");
+                if y > bottom_limit {
+                    pages.push(std::mem::take(&mut current));
+                    cursor_y = Some(top_baseline_for(line_height));
+                }
+                let final_y = cursor_y.unwrap();
+                current.lines.push(PlacedLine {
+                    y: final_y,
+                    x: text_x,
+                    font_size_pt: font_size,
+                    text: line,
+                    color: style.color,
+                });
+                cursor_y = Some(final_y + line_height);
+            }
+            if let Some(y) = cursor_y.as_mut() {
+                *y += pad_bot + border_w;
+            }
+        }
+
         if let Some(y) = cursor_y.as_mut() {
             *y += font_size * style.margin_bottom_em;
         }
-
-        let _ = i; // index unused but keeps loop shape obvious for future cascade work
     }
 
     if !current.is_empty() {
@@ -247,10 +400,16 @@ fn plan_pages_styled(
 mod tests {
     use super::*;
 
-    /// Helper: parse some HTML, plan its pages with a custom layout box and
-    /// no author CSS. Returns the doc (held alive so element_ids stay valid)
-    /// alongside the planned pages.
+    /// Helper: parse some HTML, plan its pages, and return the per-page
+    /// line lists. Used by the bulk of the existing tests, which only
+    /// care about glyph placement.
     fn plan(html: &str) -> Vec<Vec<PlacedLine>> {
+        plan_full(html).into_iter().map(|p| p.lines).collect()
+    }
+
+    /// Helper variant returning the full per-page plan (boxes + lines).
+    /// Used by the Phase 1.7b box-model tests below.
+    fn plan_full(html: &str) -> Vec<PagePlan> {
         let doc = parse::Document::parse(html);
         let paragraphs = doc.paragraphs();
         let rules = doc.user_stylesheet();
@@ -462,5 +621,94 @@ mod tests {
         );
         let orphan = pages[0].iter().find(|l| l.text == "orphan").unwrap();
         assert_eq!(orphan.color, Color::rgb(0, 128, 0));
+    }
+
+    // ---- Phase 1.7b: box-model paint pass.
+
+    #[test]
+    fn no_decoration_emits_no_box() {
+        let pages = plan_full("<p>hello</p>");
+        assert!(pages[0].boxes.is_empty(), "plain p should not emit a box");
+        assert_eq!(pages[0].lines.len(), 1);
+    }
+
+    #[test]
+    fn bg_color_emits_box_with_fill() {
+        let pages = plan_full(
+            "<style>p { background-color: yellow; }</style><p>x</p>",
+        );
+        assert_eq!(pages[0].boxes.len(), 1);
+        let b = &pages[0].boxes[0];
+        assert_eq!(b.fill, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(b.stroke, None);
+        assert!(b.w > 0.0 && b.h > 0.0);
+    }
+
+    #[test]
+    fn border_emits_box_with_stroke() {
+        let pages = plan_full(
+            "<style>p { border-width: 2px; border-color: red; \
+                        border-style: solid; }</style><p>x</p>",
+        );
+        assert_eq!(pages[0].boxes.len(), 1);
+        let b = &pages[0].boxes[0];
+        assert_eq!(b.fill, None);
+        let (col, w) = b.stroke.expect("expected stroke");
+        assert_eq!(col, Color::rgb(255, 0, 0));
+        assert!((w - 2.0).abs() < 0.01, "stroke width 2pt expected, got {w}");
+    }
+
+    #[test]
+    fn border_style_none_suppresses_stroke() {
+        let pages = plan_full(
+            "<style>p { border-width: 4px; border-style: none; \
+                        background-color: blue; }</style><p>x</p>",
+        );
+        // bg present so a box exists, but no stroke (border-style: none → width 0).
+        assert_eq!(pages[0].boxes.len(), 1);
+        assert_eq!(pages[0].boxes[0].stroke, None);
+        assert_eq!(pages[0].boxes[0].fill, Some(Color::rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn padding_shifts_text_origin_to_the_right() {
+        let plain = plan_full("<p>x</p>");
+        let padded = plan_full(
+            "<style>p { padding-left: 24px; }</style><p>x</p>",
+        );
+        let plain_x = plain[0].lines[0].x;
+        let padded_x = padded[0].lines[0].x;
+        // 24px = 24pt at our 1pt/px conversion baseline.
+        assert!(
+            (padded_x - plain_x - 24.0).abs() < 0.5,
+            "padding-left:24px should shift x by ~24pt (got {plain_x} vs {padded_x})"
+        );
+    }
+
+    #[test]
+    fn padding_top_pushes_text_down() {
+        let plain = plan_full("<p>x</p>");
+        let padded = plan_full(
+            "<style>p { padding-top: 24px; background-color: yellow; }</style>\
+             <p>x</p>",
+        );
+        let plain_y = plain[0].lines[0].y;
+        let padded_y = padded[0].lines[0].y;
+        assert!(
+            padded_y > plain_y + 20.0,
+            "padding-top should push first baseline downward \
+             (plain={plain_y}, padded={padded_y})"
+        );
+    }
+
+    #[test]
+    fn box_geometry_matches_indent_and_content_width() {
+        // Plain <p> at left_margin=36, content_width=500 (from plan_full's setup).
+        let pages = plan_full(
+            "<style>p { background-color: black; }</style><p>x</p>",
+        );
+        let b = &pages[0].boxes[0];
+        assert!((b.x - 36.0).abs() < 0.01, "box x should be left margin: {}", b.x);
+        assert!((b.w - 500.0).abs() < 0.01, "box w should be content width: {}", b.w);
     }
 }
