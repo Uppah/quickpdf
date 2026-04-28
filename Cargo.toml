@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/quickpdf-core", "crates/quickpdf-py"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Philip-thorsen/quickpdf"
+rust-version = "1.75"
+
+[workspace.dependencies]
+quickpdf-core = { path = "crates/quickpdf-core" }
+
+krilla = "0.7"
+thiserror = "2"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+
+# Phase 1.1: HTML parsing. `scraper` wraps html5ever with a stable, ergonomic
+# DOM API (ego-tree based) and pulls in `selectors`/`cssparser` we'll reuse
+# for the Phase 1 CSS cascade. We default-features=false to skip the CLI tools
+# (getopts, errors) we don't need.
+scraper = { version = "0.26", default-features = false }
+
+# Phase 1.4: glyph-advance measurement for word-wrap. Pinned to the version
+# krilla 0.7 uses so we don't pull two copies of skrifa into the wheel.
+skrifa = "0.37"
+
+# Phase 1.6b: stable handles into scraper's DOM so paragraphs can be matched
+# against author CSS. ego-tree is already a transitive dep; we just need the
+# direct import for `NodeId`.
+ego-tree = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1  # otherwise debug builds of krilla are very slow

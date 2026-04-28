@@ -1,0 +1,14 @@
+/target/
+/dist/
+/build/
+*.so
+*.pyd
+*.dll
+*.dylib
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
+*.egg-info/

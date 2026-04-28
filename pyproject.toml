@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quickpdf"
+version = "0.0.1"
+description = "Native Rust HTML→PDF library for Python. Fast preview + bulk generation, no Chromium."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Philip Thorsen" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Printing",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pypdf>=4"]
+bench = ["playwright>=1.40", "weasyprint>=62"]
+
+[tool.maturin]
+manifest-path = "crates/quickpdf-py/Cargo.toml"
+python-source = "python"
+module-name = "quickpdf._native"
+features = ["pyo3/extension-module"]
+strip = true

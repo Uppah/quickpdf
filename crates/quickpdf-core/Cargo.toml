@@ -1,0 +1,15 @@
+[package]
+name = "quickpdf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Native HTML→PDF rendering core for quickpdf. No Python."
+
+[dependencies]
+krilla = { workspace = true }
+thiserror = { workspace = true }
+scraper = { workspace = true }
+skrifa = { workspace = true }
+ego-tree = { workspace = true }
