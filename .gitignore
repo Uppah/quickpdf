@@ -12,3 +12,6 @@ __pycache__/
 .vscode/
 .idea/
 *.egg-info/
+
+# Phase planning artifacts (parallel-sprint contracts) — see CLAUDE.md
+.claude-*-contracts.md

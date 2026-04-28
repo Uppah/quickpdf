@@ -27,14 +27,14 @@ something genuinely new, not another browser wrapper.
 |  1.5  |   ✓    | Block layout (paragraphs stack vertically) + multi-page                              |
 | 1.6a  |   ✓    | UA stylesheet (per-tag `BlockStyle`)                                                 |
 | 1.6b  |   ✓    | Inline `<style>` cascade: tag/class/id/descendant selectors; 4 properties            |
-| 1.6c  |   →    | **NEXT.** Specificity, inheritance, `!important`, anonymous-block wrap of orphan text |
-|  1.7  |        | Colours, borders, padding, backgrounds                                               |
+| 1.6c  |   ✓    | Specificity, `!important`, inheritance via parent-chain walk, anonymous-block wrap   |
+|  1.7  |   →    | **NEXT.** Colours, borders, padding, backgrounds                                     |
 |   2   |        | Tables, images, web fonts → renders email-style HTML                                 |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf` v0.1                        |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel                                   |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS                              |
 
-**Test posture today:** 52 Rust unit tests + 22 Python integration tests, all
+**Test posture today:** 98 Rust unit tests + 27 Python integration tests, all
 green in ~0.3 s combined.
 
 ## Build + test (always)
@@ -74,10 +74,10 @@ quickpdf/
 │   │       ├── font.rs              # FALLBACK_TTF (include_bytes!)
 │   │       ├── text.rs              # TextMetrics, wrap_lines (greedy word-wrap)
 │   │       └── style/               # CSS pipeline (Phase 1.6 family)
-│   │           ├── mod.rs           # BlockStyle, ua_style, style::resolve
-│   │           ├── sheet.rs         # CSS parser → Vec<Rule>
-│   │           ├── matcher.rs       # selector parse + match against ElementRef
-│   │           └── cascade.rs       # property → BlockStyle override
+│   │           ├── mod.rs           # BlockStyle, ua_style, resolve (cascade + inherit)
+│   │           ├── sheet.rs         # CSS parser → Vec<Rule>; !important stripping
+│   │           ├── matcher.rs       # selector parse + match + Specificity
+│   │           └── cascade.rs       # apply_declarations, BlockStyleBuilder, inherit
 │   └── quickpdf-py/                 # PyO3 cdylib → quickpdf._native
 │       └── src/lib.rs               # html_to_pdf binding + debug helpers
 ├── python/quickpdf/
@@ -117,7 +117,7 @@ quickpdf/
   This matches the upstream LocalSFMC flow (AMPScript runs first → fully
   rendered HTML → quickpdf).
 - **`<script>` ignored, `<style>` parsed.** External stylesheets via `<link
-  rel="stylesheet">` and inline `style="..."` attribute are deferred to 1.6c.
+  rel="stylesheet">` and inline `style="..."` attribute are deferred to 1.7+.
 - **Self-contained wheel is sacred.** No subprocess, no system-font requirement,
   no runtime download of binaries. Adding a Chromium binary defeats the whole
   project — it's not an optimisation, it's a defection to Track A.
@@ -129,46 +129,45 @@ quickpdf/
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next
   to it and **must be preserved on any redistribution**.
 
-## Next session: Phase 1.6c
+## Next session: Phase 1.7
 
 Spec lives in `~/.claude/plans/cheerful-riding-castle.md` under "Phasing".
-Concrete deliverables:
+Phase 1.7 adds visual properties on top of the now-complete cascade:
 
-1. **Specificity calculation.** Add an `(a, b, c)` tuple per matched declaration
-   (a = id count, b = class count, c = tag count). Replace last-wins with
-   highest-specificity-then-source-order ordering inside `cascade::apply_declarations`.
-2. **`!important`.** Strip the trailing `!important` from values in
-   `sheet::Declaration` parse, store a `bool important` flag, sort important
-   declarations after non-important ones regardless of specificity.
-3. **Inheritance.** Walk the DOM ancestor chain when resolving an element so
-   inherited properties (font-size, color, line-height) propagate. Today
-   `style::resolve` only looks at the element itself.
-4. **Anonymous-block wrap.** When a block-level element mixes inline text with
-   block children (e.g. `<div>text<p>more</p></div>`), the orphan "text" should
-   form an anonymous paragraph instead of being dropped (current behaviour in
-   `parse::collect_paragraphs`).
+1. **`color`.** Plumb a CSS color value through `BlockStyle` and into
+   `krilla::Surface::draw_text`'s paint argument. Inherited (CSS spec).
+2. **`background-color` + padding + borders.** Box-model paint pass. The
+   planner currently only emits `PlacedLine`s — Phase 1.7 needs a sibling
+   `PlacedBox` with `(x, y, w, h, fill, stroke)` rendered before each
+   block's text lines.
+3. **Length parsing extended.** Currently lengths land in `style/cascade.rs`
+   as `Npx`/`Npt`/`em`/`%` only. Phase 1.7 needs `rem` (root-em) and
+   shorthand parsing for `padding`/`margin` (1–4 values).
+4. **Inline `style="..."` attribute.** Same parser as `<style>`; treat each
+   element's attribute as a synthetic rule with selector specificity
+   `(1, 0, 0, 0)` (above any author rule).
 
-If 1.6c is too big for one session, do **specificity + !important** first (the
-parser changes in `style/sheet.rs` are small) and leave inheritance + anon
-blocks for the session after.
+## Phase 1.6 parallel-sprint pattern (proven, repeat for 1.7)
 
-## Phase 1.6c parallel-sprint plan (proven pattern)
-
-Phase 1.6b used a 4-agent pattern that landed cleanly:
-- 1 **Plan agent** as coordinator, producing 3 frozen interface contracts.
-- 3 **general-purpose agents** as developers, each owning one slice file with
+Phases 1.6b and 1.6c both used a 4-agent pattern that landed cleanly:
+- 1 **Plan agent** as coordinator, producing N frozen interface contracts.
+- N **general-purpose agents** as developers, each owning one slice file with
   hard "don't touch other files" constraints.
 - 1 **integrator** (the main thread) wiring everything together.
 
-For 1.6c the natural slices are:
-- Slice A — specificity calc in `style/matcher.rs` (selector → `(u32,u32,u32)`).
-- Slice B — `!important` parsing + flag in `style/sheet.rs`.
-- Slice C — inheritance walk + anon-block creation in `style/cascade.rs` and
-  `parse.rs`.
+The pattern: Plan agent writes the contracts (saved to a `.claude-1.7-contracts.md`
+artifact for durability), then launch the slice agents in parallel via a single
+message with `Agent` + `run_in_background: true`. The integrator handles any
+cross-file fixups that the slice contracts deliberately deferred.
 
-Use the same pattern: ask a Plan agent to write three locked specs, then launch
-three general-purpose agents in parallel via a single message with three
-`Agent` calls in `run_in_background: true` mode.
+Lessons from 1.6c worth keeping:
+- Slice agents must accept that adding a field to a shared struct (e.g.
+  `Declaration::important`) breaks an unrelated file's test helper, and
+  that's the integrator's job to reconcile on merge — NOT a contract violation.
+- `cargo check -p quickpdf-core` is the right green-bar gate for slice agents
+  because it skips `#[cfg(test)]` bodies and won't trip on the cross-file fixup.
+- The integrator should run the **full** `cargo test -p quickpdf-core --lib`
+  immediately after merging the cross-file fix.
 
 ## Repo / GitHub state
 

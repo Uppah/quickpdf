@@ -305,4 +305,103 @@ mod tests {
             huge.font_size_pt
         );
     }
+
+    // ---- Phase 1.6c: specificity, !important, inheritance, anonymous wrap.
+
+    /// `#id` rule (specificity 1,0,0) beats `.class` rule (0,1,0) regardless
+    /// of source order — even when the lower-specificity rule appears later.
+    #[test]
+    fn id_selector_beats_class_even_when_class_is_later() {
+        let html = r#"<style>
+            #target { font-size: 24px; }
+            .x { font-size: 36px; }
+        </style><p id="target" class="x">x</p>"#;
+        let pages = plan(html);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert!(
+            (line.font_size_pt - 24.0).abs() < 0.01,
+            "expected 24pt (id wins), got {}",
+            line.font_size_pt
+        );
+    }
+
+    /// `!important` on a less-specific rule beats a more-specific rule
+    /// without the marker.
+    #[test]
+    fn important_beats_higher_specificity() {
+        let html = r#"<style>
+            #target { font-size: 24px; }
+            p { font-size: 48px !important; }
+        </style><p id="target">x</p>"#;
+        let pages = plan(html);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert!(
+            (line.font_size_pt - 48.0).abs() < 0.01,
+            "expected 48pt (!important wins), got {}",
+            line.font_size_pt
+        );
+    }
+
+    /// Two `!important` declarations with different specificities — the
+    /// higher-specificity one wins.
+    #[test]
+    fn important_vs_important_falls_back_to_specificity() {
+        let html = r#"<style>
+            p { font-size: 18px !important; }
+            #target { font-size: 30px !important; }
+        </style><p id="target">x</p>"#;
+        let pages = plan(html);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert!(
+            (line.font_size_pt - 30.0).abs() < 0.01,
+            "expected 30pt (id-important wins over tag-important), got {}",
+            line.font_size_pt
+        );
+    }
+
+    /// A child paragraph in an unstyled tag should inherit `font-size` from
+    /// an ancestor that set it. `<div>` is a leaf block when it has no block
+    /// children, so the test wraps in a structure where inheritance flows.
+    #[test]
+    fn font_size_inherits_from_styled_ancestor() {
+        let html = r#"<style>
+            section { font-size: 24px; }
+        </style><section><p>inherits</p></section>"#;
+        let pages = plan(html);
+        let line = pages[0].iter().find(|l| l.text == "inherits").unwrap();
+        assert!(
+            (line.font_size_pt - 24.0).abs() < 0.01,
+            "expected 24pt inherited from section, got {}",
+            line.font_size_pt
+        );
+    }
+
+    /// Anonymous-block wrap: orphan text inside a block container that also
+    /// has block children renders as its own paragraph (rather than being
+    /// dropped as in 1.6b).
+    #[test]
+    fn anonymous_block_orphan_text_is_rendered() {
+        let html = "<div>before<p>middle</p>after</div>";
+        let pages = plan(html);
+        let texts: Vec<&str> = pages[0].iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"before"), "expected 'before', got {texts:?}");
+        assert!(texts.contains(&"middle"), "expected 'middle', got {texts:?}");
+        assert!(texts.contains(&"after"), "expected 'after', got {texts:?}");
+    }
+
+    /// Anonymous paragraphs inherit their parent's resolved style, since
+    /// they share the parent's `element_id` for cascade matching.
+    #[test]
+    fn anonymous_block_inherits_parent_style() {
+        let html = r#"<style>
+            #wrap { font-size: 24px; }
+        </style><div id="wrap">orphan<p>child</p></div>"#;
+        let pages = plan(html);
+        let orphan = pages[0].iter().find(|l| l.text == "orphan").unwrap();
+        assert!(
+            (orphan.font_size_pt - 24.0).abs() < 0.01,
+            "anonymous para should resolve to parent's style (24pt), got {}",
+            orphan.font_size_pt
+        );
+    }
 }

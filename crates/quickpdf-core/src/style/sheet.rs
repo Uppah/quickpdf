@@ -29,6 +29,11 @@ pub struct Rule {
 pub struct Declaration {
     pub name: String,  // lowercased
     pub value: String, // trimmed, original casing
+    /// True iff the declaration ended in a CSS `!important` marker (any
+    /// whitespace between `!` and `important`, case-insensitive on
+    /// `important`). Stripping is repeated, so `red !important !important`
+    /// produces `value = "red"`, `important = true`. Default: `false`.
+    pub important: bool,
 }
 
 /// Parse a stylesheet source string into a flat rule list. Always returns —
@@ -306,7 +311,8 @@ fn parse_declaration_block(body: &str) -> Vec<Declaration> {
             continue;
         };
         let name = piece[..colon_idx].trim().to_ascii_lowercase();
-        let value = piece[colon_idx + 1..].trim().to_string();
+        let raw_value = piece[colon_idx + 1..].trim();
+        let (value, important) = strip_important(raw_value);
         if name.is_empty() || value.is_empty() {
             continue;
         }
@@ -317,9 +323,62 @@ fn parse_declaration_block(body: &str) -> Vec<Declaration> {
         if name.chars().any(|c| c.is_whitespace()) {
             continue;
         }
-        out.push(Declaration { name, value });
+        out.push(Declaration {
+            name,
+            value,
+            important,
+        });
     }
     out
+}
+
+/// Strip a trailing CSS `!important` marker from `value`, repeatedly.
+/// Returns `(stripped_value, important)`.
+///
+/// What counts as a trailing `!important`:
+/// - The literal byte `!`,
+/// - then zero or more ASCII whitespace,
+/// - then the ASCII letters `important` in any case,
+/// - then optional trailing whitespace,
+/// - at the **end** of the value.
+///
+/// Repeated markers are all stripped: `red !important !important` →
+/// `("red", true)`. If the marker is not at the very end (e.g.
+/// `red !important extra`), the value is preserved verbatim.
+fn strip_important(value: &str) -> (String, bool) {
+    let mut current: String = value.to_string();
+    let mut important = false;
+    loop {
+        // Trim trailing whitespace.
+        let trimmed = current.trim_end();
+        // Check for case-insensitive trailing "important" (9 letters).
+        if trimmed.len() < 9 {
+            current = trimmed.to_string();
+            break;
+        }
+        let tail = &trimmed[trimmed.len() - 9..];
+        if !tail.eq_ignore_ascii_case("important") {
+            current = trimmed.to_string();
+            break;
+        }
+        // Strip the 9-letter "important" suffix.
+        let after_word = &trimmed[..trimmed.len() - 9];
+        // Trim trailing whitespace between `!` and `important`.
+        let after_ws = after_word.trim_end();
+        // Must end with `!`.
+        if !after_ws.ends_with('!') {
+            // Tail looks like "important" but no `!` — not a marker.
+            current = trimmed.to_string();
+            break;
+        }
+        // Strip the `!` and mark important.
+        let stripped = &after_ws[..after_ws.len() - 1];
+        important = true;
+        current = stripped.to_string();
+        // Loop to handle repeated markers.
+    }
+    let final_value = current.trim().to_string();
+    (final_value, important)
 }
 
 /// Remove `/* ... */` comments from a string. Strings are honored so a
@@ -551,5 +610,149 @@ mod tests {
     fn collect_style_blocks_returns_empty_when_no_styles() {
         let doc = crate::parse::Document::parse("<p>hi</p>");
         assert!(collect_style_blocks(&doc).is_empty());
+    }
+
+    // ---- Phase 1.6c Slice B: !important parsing tests. ----
+
+    #[test]
+    fn important_basic_sets_flag_and_strips() {
+        let rules = parse_stylesheet("p { color: red !important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].name, "color");
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_no_space_between_bang_and_word() {
+        let rules = parse_stylesheet("p { color: red!important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_with_whitespace_between_bang_and_word() {
+        let rules = parse_stylesheet("p { color: red ! important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_uppercase_keyword() {
+        let rules = parse_stylesheet("p { color: red !IMPORTANT; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_mixed_case_keyword() {
+        let rules = parse_stylesheet("p { color: red !Important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_repeated_strips_all() {
+        let rules = parse_stylesheet("p { color: red !important !important !important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_word_alone_is_not_a_marker() {
+        let rules = parse_stylesheet("p { color: important; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "important");
+        assert!(!rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_marker_must_be_trailing() {
+        let rules = parse_stylesheet("p { color: red !important extra; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red !important extra");
+        assert!(!rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_only_value_is_dropped_as_empty() {
+        // `!important` with nothing else strips to "" which triggers the
+        // empty-value drop path.
+        let rules = parse_stylesheet("p { color: !important; font-size: 12px; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].name, "font-size");
+    }
+
+    #[test]
+    fn important_default_false_for_plain_decl() {
+        let rules = parse_stylesheet("p { color: red; }");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 1);
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(!rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn important_works_with_multiple_decls_in_block() {
+        let rules = parse_stylesheet(
+            "p { color: red !important; font-size: 12px; margin-top: 4px !IMPORTANT; }",
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].declarations.len(), 3);
+        assert_eq!(rules[0].declarations[0].name, "color");
+        assert_eq!(rules[0].declarations[0].value, "red");
+        assert!(rules[0].declarations[0].important);
+        assert_eq!(rules[0].declarations[1].name, "font-size");
+        assert_eq!(rules[0].declarations[1].value, "12px");
+        assert!(!rules[0].declarations[1].important);
+        assert_eq!(rules[0].declarations[2].name, "margin-top");
+        assert_eq!(rules[0].declarations[2].value, "4px");
+        assert!(rules[0].declarations[2].important);
+    }
+
+    #[test]
+    fn strip_important_unit_table() {
+        use super::strip_important;
+        // The full edge-case behaviour table from the contract.
+        assert_eq!(strip_important("red"), ("red".to_string(), false));
+        assert_eq!(strip_important("red !important"), ("red".to_string(), true));
+        assert_eq!(strip_important("red!important"), ("red".to_string(), true));
+        assert_eq!(strip_important("red ! important"), ("red".to_string(), true));
+        assert_eq!(strip_important("red !IMPORTANT"), ("red".to_string(), true));
+        assert_eq!(strip_important("red !Important"), ("red".to_string(), true));
+        assert_eq!(strip_important("red !important "), ("red".to_string(), true));
+        assert_eq!(
+            strip_important("red !important !important"),
+            ("red".to_string(), true)
+        );
+        assert_eq!(
+            strip_important("red !important !important !important"),
+            ("red".to_string(), true)
+        );
+        assert_eq!(strip_important("important"), ("important".to_string(), false));
+        assert_eq!(
+            strip_important("red important"),
+            ("red important".to_string(), false)
+        );
+        assert_eq!(
+            strip_important("red !important extra"),
+            ("red !important extra".to_string(), false)
+        );
+        assert_eq!(strip_important(" !important "), ("".to_string(), true));
+        assert_eq!(strip_important("12px"), ("12px".to_string(), false));
     }
 }

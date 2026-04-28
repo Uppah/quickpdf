@@ -1,9 +1,10 @@
-//! User-agent default stylesheet + Phase 1.6b cascade infrastructure.
+//! User-agent default stylesheet + Phase 1.6c cascade infrastructure.
 //!
 //! - 1.6a: hard-coded per-tag defaults (this file).
 //! - 1.6b: inline `<style>` parsing (sheet), simple-selector matching
 //!   (matcher), and last-declaration-wins cascade (cascade) — submodules.
-//! - 1.6c (later): full cascade with specificity and inheritance.
+//! - 1.6c: full specificity ordering, `!important`, and inheritance via
+//!   parent-chain walk + `cascade::inherit`.
 
 pub mod cascade;
 pub mod matcher;
@@ -11,30 +12,80 @@ pub mod sheet;
 
 pub use cascade::TextAlign;
 
-/// Resolve the final `BlockStyle` for a paragraph element by combining the
-/// UA default (from `ua_style(tag)`) with any author rules from the document
-/// stylesheet whose selectors match the element. Phase 1.6b cascade is
-/// "last-declaration-wins" — the full specificity calculation is 1.6c.
+/// Resolve the final `BlockStyle` for a paragraph element by combining
+/// UA defaults, the author cascade (with full specificity + `!important`),
+/// and inheritance from the element's ancestor chain.
+///
+/// Cascade order, ascending (so the last-applied wins inside
+/// `cascade::apply_declarations`):
+///
+/// 1. `important` flag — `false` before `true`. `!important` declarations
+///    always win over non-important regardless of specificity.
+/// 2. Specificity — lexicographic `(ids, classes, tags)`.
+/// 3. Source order — earlier rules lose ties to later rules.
+///
+/// Inheritance walks root-to-element, folding `cascade::inherit` so the
+/// inherited properties (`font-size`, `text-align`) propagate down.
 pub fn resolve(
+    element: scraper::ElementRef<'_>,
+    rules: &[sheet::Rule],
+) -> BlockStyle {
+    // Build the ancestor chain root-first so we can fold inheritance forward.
+    let mut chain: Vec<scraper::ElementRef<'_>> = Vec::new();
+    let mut cur = Some(element);
+    while let Some(e) = cur {
+        chain.push(e);
+        cur = e.parent().and_then(scraper::ElementRef::wrap);
+    }
+    chain.reverse();
+
+    let mut inherited: Option<BlockStyle> = None;
+    for e in chain {
+        let local = resolve_local(e, rules);
+        inherited = Some(match inherited.as_ref() {
+            Some(parent) => cascade::inherit(parent, local),
+            None => local,
+        });
+    }
+    inherited.unwrap_or(BlockStyle::DEFAULT)
+}
+
+/// Resolve an element's *local* `BlockStyle` — UA defaults plus the
+/// author cascade for rules that match this element. Does NOT walk
+/// ancestors; that's `resolve`'s job.
+fn resolve_local(
     element: scraper::ElementRef<'_>,
     rules: &[sheet::Rule],
 ) -> BlockStyle {
     let tag = element.value().name();
     let ua = ua_style(tag);
 
-    // Walk rules in source order. For each rule whose selector list contains
-    // ANY selector that matches our element, append all its declarations to
-    // the working list. Cascade applies them in source order.
-    let mut decls: Vec<sheet::Declaration> = Vec::new();
+    // For each rule, find the highest-specificity selector in its list that
+    // matches this element. If any selector matches, record every declaration
+    // tagged with (important, specificity, source_order) so the sort below
+    // can produce the correct cascade order.
+    let mut decls: Vec<(bool, matcher::Specificity, usize, sheet::Declaration)> =
+        Vec::new();
     for rule in rules {
         let selectors = matcher::parse_selector_list(&rule.selector_text);
-        let any_matches = selectors.iter().any(|s| matcher::matches(s, element));
-        if any_matches {
-            decls.extend(rule.declarations.iter().cloned());
+        let winning_spec = selectors
+            .iter()
+            .filter(|s| matcher::matches(s, element))
+            .map(matcher::specificity)
+            .max();
+        if let Some(spec) = winning_spec {
+            for d in &rule.declarations {
+                decls.push((d.important, spec, rule.source_order, d.clone()));
+            }
         }
     }
+    // Ascending: (false, low-spec, early) ... (true, high-spec, late).
+    // `apply_declarations` walks the slice in order with last-wins semantics,
+    // so the highest-priority declaration ends up applied last.
+    decls.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
 
-    cascade::apply_declarations(ua, &decls)
+    let flat: Vec<sheet::Declaration> = decls.into_iter().map(|(_, _, _, d)| d).collect();
+    cascade::apply_declarations(ua, &flat)
 }
 
 /// Style hints attached to a paragraph by the user-agent stylesheet.

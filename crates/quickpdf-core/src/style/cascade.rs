@@ -135,6 +135,86 @@ fn parse_text_align(value: &str) -> Option<TextAlign> {
     }
 }
 
+/// Builder that tracks **which** `BlockStyle` fields were explicitly set
+/// by author rules, so inheritance can fill in the un-set ones from a
+/// parent's resolved `BlockStyle`.
+///
+/// Inherited properties (CSS) — fall back to parent if `None`:
+/// - `font_size_em`
+/// - `text_align`
+///
+/// Non-inherited properties — fall back to `BlockStyle::DEFAULT` regardless
+/// of parent:
+/// - `bold` (CSS spec inherits `font-weight`, but we have no bold font yet;
+///   revisit Phase 4)
+/// - `margin_top_em`, `margin_bottom_em`, `indent_em`
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockStyleBuilder {
+    pub font_size_em: Option<f32>,
+    pub bold: Option<bool>,
+    pub margin_top_em: Option<f32>,
+    pub margin_bottom_em: Option<f32>,
+    pub indent_em: Option<f32>,
+    pub text_align: Option<TextAlign>,
+}
+
+impl BlockStyleBuilder {
+    pub fn new() -> Self { Self::default() }
+
+    /// Wrap an already-resolved `BlockStyle` as a builder where every
+    /// field is treated as explicitly set.
+    pub fn from_block(style: BlockStyle) -> Self {
+        Self {
+            font_size_em: Some(style.font_size_em),
+            bold: Some(style.bold),
+            margin_top_em: Some(style.margin_top_em),
+            margin_bottom_em: Some(style.margin_bottom_em),
+            indent_em: Some(style.indent_em),
+            text_align: Some(style.text_align),
+        }
+    }
+
+    /// Finalise into a `BlockStyle`. Inherited fields (`font_size_em`,
+    /// `text_align`) fall back to `parent` if `Some`, else `BlockStyle::DEFAULT`.
+    /// Non-inherited fields always fall back to `BlockStyle::DEFAULT`.
+    pub fn build(self, parent: Option<&BlockStyle>) -> BlockStyle {
+        let def = BlockStyle::DEFAULT;
+        BlockStyle {
+            font_size_em: self.font_size_em.unwrap_or_else(||
+                parent.map(|p| p.font_size_em).unwrap_or(def.font_size_em)),
+            bold: self.bold.unwrap_or(def.bold),
+            margin_top_em: self.margin_top_em.unwrap_or(def.margin_top_em),
+            margin_bottom_em: self.margin_bottom_em.unwrap_or(def.margin_bottom_em),
+            indent_em: self.indent_em.unwrap_or(def.indent_em),
+            text_align: self.text_align.unwrap_or_else(||
+                parent.map(|p| p.text_align).unwrap_or(def.text_align)),
+        }
+    }
+}
+
+/// Transitional inheritance helper. Per-field, if `child` equals
+/// `BlockStyle::DEFAULT` for that field, take `parent`'s value;
+/// otherwise keep child's. Only `font_size_em` and `text_align` participate.
+pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
+    let def = BlockStyle::DEFAULT;
+    BlockStyle {
+        font_size_em: if (child.font_size_em - def.font_size_em).abs() < f32::EPSILON {
+            parent.font_size_em
+        } else {
+            child.font_size_em
+        },
+        bold: child.bold,
+        margin_top_em: child.margin_top_em,
+        margin_bottom_em: child.margin_bottom_em,
+        indent_em: child.indent_em,
+        text_align: if child.text_align == def.text_align {
+            parent.text_align
+        } else {
+            child.text_align
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +223,7 @@ mod tests {
         Declaration {
             name: name.to_string(),
             value: value.to_string(),
+            important: false,
         }
     }
 
@@ -241,5 +322,136 @@ mod tests {
             &[d("text-align", "banana")],
         );
         assert_eq!(out2.text_align, TextAlign::Left);
+    }
+
+    #[test]
+    fn builder_default_all_none_then_default_block_no_parent() {
+        let b = BlockStyleBuilder::default();
+        assert!(b.font_size_em.is_none());
+        assert!(b.bold.is_none());
+        assert!(b.margin_top_em.is_none());
+        assert!(b.margin_bottom_em.is_none());
+        assert!(b.indent_em.is_none());
+        assert!(b.text_align.is_none());
+        let s = b.build(None);
+        let def = BlockStyle::DEFAULT;
+        assert_eq!(s.font_size_em, def.font_size_em);
+        assert_eq!(s.bold, def.bold);
+        assert_eq!(s.margin_top_em, def.margin_top_em);
+        assert_eq!(s.margin_bottom_em, def.margin_bottom_em);
+        assert_eq!(s.indent_em, def.indent_em);
+        assert_eq!(s.text_align, def.text_align);
+    }
+
+    #[test]
+    fn builder_inherits_font_size_from_parent_when_unset() {
+        let parent = BlockStyle {
+            font_size_em: 2.0,
+            ..BlockStyle::DEFAULT
+        };
+        let s = BlockStyleBuilder::new().build(Some(&parent));
+        assert_eq!(s.font_size_em, 2.0);
+    }
+
+    #[test]
+    fn builder_does_not_inherit_margin() {
+        let parent = BlockStyle {
+            margin_top_em: 5.0,
+            margin_bottom_em: 5.0,
+            indent_em: 5.0,
+            ..BlockStyle::DEFAULT
+        };
+        let s = BlockStyleBuilder::new().build(Some(&parent));
+        assert_eq!(s.margin_top_em, BlockStyle::DEFAULT.margin_top_em);
+        assert_eq!(s.margin_bottom_em, BlockStyle::DEFAULT.margin_bottom_em);
+        assert_eq!(s.indent_em, BlockStyle::DEFAULT.indent_em);
+    }
+
+    #[test]
+    fn builder_explicit_value_wins_over_parent() {
+        let parent = BlockStyle {
+            font_size_em: 2.0,
+            ..BlockStyle::DEFAULT
+        };
+        let mut b = BlockStyleBuilder::new();
+        b.font_size_em = Some(0.5);
+        let s = b.build(Some(&parent));
+        assert_eq!(s.font_size_em, 0.5);
+    }
+
+    #[test]
+    fn builder_inherits_text_align() {
+        let parent = BlockStyle {
+            text_align: TextAlign::Center,
+            ..BlockStyle::DEFAULT
+        };
+        let s = BlockStyleBuilder::new().build(Some(&parent));
+        assert_eq!(s.text_align, TextAlign::Center);
+    }
+
+    #[test]
+    fn builder_from_block_round_trips() {
+        let original = BlockStyle {
+            font_size_em: 1.25,
+            bold: true,
+            margin_top_em: 0.5,
+            margin_bottom_em: 0.75,
+            indent_em: 1.5,
+            text_align: TextAlign::Right,
+        };
+        let b = BlockStyleBuilder::from_block(original);
+        // No parent — every field should round-trip from the builder.
+        let s = b.build(None);
+        assert_eq!(s.font_size_em, original.font_size_em);
+        assert_eq!(s.bold, original.bold);
+        assert_eq!(s.margin_top_em, original.margin_top_em);
+        assert_eq!(s.margin_bottom_em, original.margin_bottom_em);
+        assert_eq!(s.indent_em, original.indent_em);
+        assert_eq!(s.text_align, original.text_align);
+    }
+
+    #[test]
+    fn inherit_helper_takes_parent_font_size_when_child_is_default() {
+        let parent = BlockStyle {
+            font_size_em: 2.0,
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle::DEFAULT;
+        let s = inherit(&parent, child);
+        assert_eq!(s.font_size_em, 2.0);
+    }
+
+    #[test]
+    fn inherit_helper_keeps_child_font_size_when_set() {
+        let parent = BlockStyle {
+            font_size_em: 2.0,
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle {
+            font_size_em: 0.5,
+            ..BlockStyle::DEFAULT
+        };
+        let s = inherit(&parent, child);
+        assert_eq!(s.font_size_em, 0.5);
+    }
+
+    #[test]
+    fn inherit_helper_does_not_change_margins() {
+        let parent = BlockStyle {
+            margin_top_em: 5.0,
+            margin_bottom_em: 5.0,
+            indent_em: 5.0,
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle {
+            margin_top_em: 0.25,
+            margin_bottom_em: 0.5,
+            indent_em: 0.75,
+            ..BlockStyle::DEFAULT
+        };
+        let s = inherit(&parent, child);
+        assert_eq!(s.margin_top_em, 0.25);
+        assert_eq!(s.margin_bottom_em, 0.5);
+        assert_eq!(s.indent_em, 0.75);
     }
 }

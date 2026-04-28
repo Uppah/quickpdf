@@ -9,6 +9,12 @@ use ego_tree::NodeId;
 
 use crate::style::sheet::{self, Rule};
 
+/// Sentinel `Paragraph::tag` value for an anonymous block created by
+/// `collect_paragraphs` to wrap orphan inline content inside a container
+/// element that also has block children. Anonymous paragraphs reuse the
+/// **parent** element's `element_id`.
+pub const ANONYMOUS_TAG: &str = "anonymous";
+
 /// Parsed HTML document. Owns the underlying DOM arena.
 pub struct Document {
     pub(crate) html: Html,
@@ -176,7 +182,9 @@ fn collect_text(elem: ElementRef<'_>, out: &mut String) {
 }
 
 /// Walk the tree and emit one `Paragraph` per "leaf" block-level element,
-/// where leaf = no block-level descendants. Recurses into containers.
+/// where leaf = no block-level descendants. Recurses into containers, and
+/// (Phase 1.6c) wraps orphan inline content inside a mixed-content block in
+/// anonymous paragraphs that reuse the parent element's `NodeId`.
 fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
     let name = elem.value().name();
     if is_skipped(name) {
@@ -189,10 +197,54 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
             false
         }
     });
-    if has_block_child || !is_block(name) {
-        // Container (or non-block root) — recurse into children. Orphan text
-        // mixed with block children is dropped for Phase 1.6a; anonymous-block
-        // wrapping comes in Phase 1.6b.
+    if is_block(name) && has_block_child {
+        // Mixed-content block: walk children in order, accumulating inline
+        // text/element runs into an anonymous buffer. Block element children
+        // flush the buffer (only if non-empty after whitespace collapse) and
+        // then recurse normally. Skipped subtrees contribute nothing.
+        let parent_id = elem.id();
+        let mut buffer = String::new();
+        let flush =
+            |buffer: &mut String, out: &mut Vec<Paragraph>| {
+                let collapsed = collapse_whitespace(buffer.as_str());
+                if !collapsed.is_empty() {
+                    out.push(Paragraph {
+                        tag: ANONYMOUS_TAG.to_string(),
+                        text: collapsed,
+                        element_id: parent_id,
+                    });
+                }
+                buffer.clear();
+            };
+        for child in elem.children() {
+            match child.value() {
+                Node::Text(t) => buffer.push_str(&t.text),
+                Node::Element(e) => {
+                    let child_name = e.name();
+                    if is_skipped(child_name) {
+                        // Skipped subtree contributes no text.
+                        continue;
+                    }
+                    if let Some(child_elem) = ElementRef::wrap(child) {
+                        if is_block(child_name) {
+                            // Flush pending inline run before recursing.
+                            flush(&mut buffer, out);
+                            collect_paragraphs(child_elem, out);
+                        } else {
+                            // Inline element — feed its text into the buffer.
+                            collect_text(child_elem, &mut buffer);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Trailing inline run, if any.
+        flush(&mut buffer, out);
+        return;
+    }
+    if !is_block(name) {
+        // Non-block root — recurse into element children, no anonymous wrap.
         for child in elem.children() {
             if let Some(child_elem) = ElementRef::wrap(child) {
                 collect_paragraphs(child_elem, out);
@@ -200,7 +252,7 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
         }
         return;
     }
-    // Leaf block: gather inline text content.
+    // Leaf block (is_block && !has_block_child): gather inline text content.
     let mut text = String::new();
     collect_text(elem, &mut text);
     let collapsed = collapse_whitespace(&text);
@@ -330,5 +382,161 @@ mod tests {
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].tag, "p");
         assert_eq!(ps[0].text, "only this");
+    }
+
+    #[test]
+    fn anonymous_constant_value() {
+        assert_eq!(ANONYMOUS_TAG, "anonymous");
+    }
+
+    #[test]
+    fn anonymous_wraps_orphan_text_around_block_child() {
+        let d = Document::parse("<div>before<p>middle</p>after</div>");
+        let ps = d.paragraphs();
+        let tagged: Vec<(&str, &str)> = ps
+            .iter()
+            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                (ANONYMOUS_TAG, "before"),
+                ("p", "middle"),
+                (ANONYMOUS_TAG, "after"),
+            ]
+        );
+    }
+
+    #[test]
+    fn anonymous_uses_parent_element_id() {
+        let d = Document::parse("<div>before<p>middle</p>after</div>");
+        let ps = d.paragraphs();
+        // Find the parent <div> and assert the anonymous paragraphs
+        // resolve back through Document::element_for to that <div>.
+        let anon: Vec<&Paragraph> = ps
+            .iter()
+            .filter(|p| p.tag == ANONYMOUS_TAG)
+            .collect();
+        assert_eq!(anon.len(), 2);
+        for a in anon {
+            let resolved = d.element_for(a).expect("anon element_id resolves");
+            assert_eq!(resolved.value().name(), "div");
+        }
+    }
+
+    #[test]
+    fn anonymous_drops_whitespace_only_runs() {
+        let d = Document::parse("<div>   <p>x</p>   </div>");
+        let ps = d.paragraphs();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].tag, "p");
+        assert_eq!(ps[0].text, "x");
+    }
+
+    #[test]
+    fn pure_leaf_block_unchanged() {
+        // <div>only text</div> has no block children → still a leaf-block
+        // tagged "div", same as before Phase 1.6c.
+        let d = Document::parse("<div>only text</div>");
+        let ps = d.paragraphs();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].tag, "div");
+        assert_eq!(ps[0].text, "only text");
+    }
+
+    #[test]
+    fn pure_block_container_unchanged() {
+        let d = Document::parse("<div><p>only</p></div>");
+        let ps = d.paragraphs();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].tag, "p");
+        assert_eq!(ps[0].text, "only");
+    }
+
+    #[test]
+    fn multiple_block_children_with_orphan_runs() {
+        let d = Document::parse(
+            "<div>before<p>p1</p>between<p>p2</p>after</div>",
+        );
+        let ps = d.paragraphs();
+        let tagged: Vec<(&str, &str)> = ps
+            .iter()
+            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                (ANONYMOUS_TAG, "before"),
+                ("p", "p1"),
+                (ANONYMOUS_TAG, "between"),
+                ("p", "p2"),
+                (ANONYMOUS_TAG, "after"),
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_elements_feed_anonymous_buffer() {
+        let d = Document::parse("<div>a<span>b</span><p>c</p>d</div>");
+        let ps = d.paragraphs();
+        let tagged: Vec<(&str, &str)> = ps
+            .iter()
+            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                (ANONYMOUS_TAG, "ab"),
+                ("p", "c"),
+                (ANONYMOUS_TAG, "d"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_anonymous_uses_correct_parent_id() {
+        // Outer div has an anon "x" tied to the div, plus a <section>
+        // that itself has mixed content → anon "y" tied to the section,
+        // followed by p "z".
+        let d = Document::parse(
+            "<div>x<section>y<p>z</p></section></div>",
+        );
+        let ps = d.paragraphs();
+        assert_eq!(ps.len(), 3);
+
+        assert_eq!(ps[0].tag, ANONYMOUS_TAG);
+        assert_eq!(ps[0].text, "x");
+        let parent0 = d.element_for(&ps[0]).unwrap();
+        assert_eq!(parent0.value().name(), "div");
+
+        assert_eq!(ps[1].tag, ANONYMOUS_TAG);
+        assert_eq!(ps[1].text, "y");
+        let parent1 = d.element_for(&ps[1]).unwrap();
+        assert_eq!(parent1.value().name(), "section");
+
+        assert_eq!(ps[2].tag, "p");
+        assert_eq!(ps[2].text, "z");
+    }
+
+    #[test]
+    fn skipped_subtree_text_does_not_leak_into_anonymous() {
+        // <script> and <style> are is_skipped — their text content should
+        // not contribute to the anonymous buffer.
+        let d = Document::parse(
+            "<div>a<script>NOPE</script><p>b</p><style>x{color:red}</style>c</div>",
+        );
+        let ps = d.paragraphs();
+        let tagged: Vec<(&str, &str)> = ps
+            .iter()
+            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                (ANONYMOUS_TAG, "a"),
+                ("p", "b"),
+                (ANONYMOUS_TAG, "c"),
+            ]
+        );
     }
 }

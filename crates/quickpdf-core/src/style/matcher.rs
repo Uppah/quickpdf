@@ -35,6 +35,23 @@ pub struct Selector {
     pub compounds: Vec<Compound>,
 }
 
+/// CSS Selectors Level 3 specificity.
+///
+/// - `0` = number of ID selectors.
+/// - `1` = number of class selectors.
+/// - `2` = number of type/tag selectors.
+///
+/// Universal selector (`*`) and combinators contribute nothing.
+///
+/// `Ord`/`PartialOrd` compare lexicographically: id beats class beats tag,
+/// so `(1,0,0) > (0,99,0) > (0,0,99)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Specificity(pub u32, pub u32, pub u32);
+
+impl Specificity {
+    pub const ZERO: Specificity = Specificity(0, 0, 0);
+}
+
 /// Parse a comma-separated selector list. Each comma yields one `Selector`.
 /// Silently drops selectors that use unsupported syntax (attribute, pseudo,
 /// sibling, `*`, `>`, `+`, `~`).
@@ -50,6 +67,25 @@ pub fn parse_selector_list(input: &str) -> Vec<Selector> {
         }
     }
     out
+}
+
+/// Compute the CSS specificity of a `Selector`. Sums simples across
+/// **every** compound in the selector's chain (descendant combinator does
+/// not change the count — `div p` has the same specificity as `p p`).
+pub fn specificity(selector: &Selector) -> Specificity {
+    let mut a = 0u32;
+    let mut b = 0u32;
+    let mut c = 0u32;
+    for compound in &selector.compounds {
+        for part in &compound.parts {
+            match part {
+                SimpleSelector::Id(_) => a += 1,
+                SimpleSelector::Class(_) => b += 1,
+                SimpleSelector::Tag(_) => c += 1,
+            }
+        }
+    }
+    Specificity(a, b, c)
 }
 
 /// Parse a single (already-trimmed, non-empty) selector. Returns `None` if
@@ -291,5 +327,62 @@ mod tests {
             sels[1].compounds[0].parts[0],
             SimpleSelector::Class("ok".to_string())
         );
+    }
+
+    /// Helper: parse a single selector or panic. Used in specificity tests
+    /// where we want a `Selector` directly without the list ceremony.
+    fn one(input: &str) -> Selector {
+        let sels = parse_selector_list(input);
+        assert_eq!(sels.len(), 1, "expected exactly one selector for {input:?}");
+        sels.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn specificity_tag_only_is_one_in_c() {
+        assert_eq!(specificity(&one("p")), Specificity(0, 0, 1));
+    }
+
+    #[test]
+    fn specificity_class_only_is_one_in_b() {
+        assert_eq!(specificity(&one(".foo")), Specificity(0, 1, 0));
+    }
+
+    #[test]
+    fn specificity_id_only_is_one_in_a() {
+        assert_eq!(specificity(&one("#bar")), Specificity(1, 0, 0));
+    }
+
+    #[test]
+    fn specificity_compound_sums_parts() {
+        assert_eq!(specificity(&one("p.foo#bar")), Specificity(1, 1, 1));
+    }
+
+    #[test]
+    fn specificity_descendant_sums_compounds() {
+        assert_eq!(specificity(&one("div p")), Specificity(0, 0, 2));
+        assert_eq!(specificity(&one("div p .x")), Specificity(0, 1, 2));
+    }
+
+    #[test]
+    fn specificity_id_beats_class_beats_tag() {
+        assert!(Specificity(1, 0, 0) > Specificity(0, 99, 0));
+        assert!(Specificity(0, 1, 0) > Specificity(0, 0, 99));
+    }
+
+    #[test]
+    fn specificity_lexicographic_within_bucket() {
+        assert!(Specificity(1, 2, 3) < Specificity(1, 2, 4));
+        assert!(Specificity(1, 2, 3) < Specificity(1, 3, 0));
+    }
+
+    #[test]
+    fn specificity_zero_for_empty_selector() {
+        let empty = Selector { compounds: vec![] };
+        assert_eq!(specificity(&empty), Specificity::ZERO);
+    }
+
+    #[test]
+    fn specificity_multi_id_multi_class() {
+        assert_eq!(specificity(&one("#a #b .c.d e")), Specificity(2, 2, 1));
     }
 }

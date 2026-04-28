@@ -254,3 +254,93 @@ def test_at_rule_does_not_break_render():
     )
     text = _pdf_text(pdf).strip()
     assert text == "hello"
+
+
+# --- Phase 1.6c: specificity, !important, inheritance, anonymous-block wrap
+
+def test_id_selector_beats_class_via_specificity():
+    # Same paragraph carries both `#wins` and `.loses`. The id rule (1,0,0)
+    # must beat the class rule (0,1,0) regardless of source order. We make
+    # the lower-specificity rule appear LATER in the stylesheet so source
+    # order can't accidentally produce the right answer.
+    body = "the quick brown fox jumps over the lazy dog " * 6
+    pdf = quickpdf.html_to_pdf(
+        "<style>"
+        "#wins { font-size: 12px; }"
+        ".loses { font-size: 48px; }"
+        "</style>"
+        f"<p id='wins' class='loses'>{body}</p>"
+    )
+    line_count = _pdf_text(pdf).strip().count("\n") + 1
+    # If specificity is wrong (class wins at 48px) the wrap explodes to many
+    # lines. With the id winning at 12px the same body fits in just a few.
+    assert line_count <= 5, (
+        f"expected id specificity to win (≤5 lines at 12px), "
+        f"got {line_count} lines"
+    )
+
+
+def test_important_overrides_higher_specificity():
+    # The `p` rule has lower specificity (0,0,1) than `#target` (1,0,0), but
+    # carries `!important`. It must win.
+    body = "the quick brown fox jumps over the lazy dog " * 6
+    pdf = quickpdf.html_to_pdf(
+        "<style>"
+        "#target { font-size: 12px; }"
+        "p { font-size: 48px !important; }"
+        "</style>"
+        f"<p id='target'>{body}</p>"
+    )
+    line_count = _pdf_text(pdf).strip().count("\n") + 1
+    # !important at 48px must dominate, producing many wrapped lines.
+    assert line_count >= 8, (
+        f"expected !important on p to win (≥8 lines at 48px), "
+        f"got {line_count} lines"
+    )
+
+
+def test_font_size_inherits_from_ancestor():
+    # An unstyled <p> nested inside a styled <section> must inherit the
+    # section's font-size. We use the same wrap-line proxy as elsewhere.
+    body = "the quick brown fox jumps over the lazy dog " * 6
+    plain = quickpdf.html_to_pdf(f"<p>{body}</p>")
+    inherited = quickpdf.html_to_pdf(
+        f"<style>section {{ font-size: 36px; }}</style>"
+        f"<section><p>{body}</p></section>"
+    )
+    plain_lines = _pdf_text(plain).strip().count("\n") + 1
+    inherited_lines = _pdf_text(inherited).strip().count("\n") + 1
+    assert inherited_lines > plain_lines, (
+        f"<p> should inherit section's 36px font-size and wrap more "
+        f"(plain={plain_lines}, inherited={inherited_lines})"
+    )
+
+
+def test_anonymous_block_renders_orphan_text():
+    # Phase 1.6b dropped orphan inline text inside a mixed-content block.
+    # 1.6c wraps it as an anonymous paragraph so it appears in the output.
+    pdf = quickpdf.html_to_pdf(
+        "<div>before<p>middle</p>after</div>"
+    )
+    text = _pdf_text(pdf)
+    for chunk in ("before", "middle", "after"):
+        assert chunk in text, f"missing '{chunk}' in {text!r}"
+
+
+def test_anonymous_block_inherits_parent_style():
+    # Anonymous paragraphs reuse the parent's element_id, so the cascade
+    # picks up author rules targeting the parent and inherits font-size.
+    body = "the quick brown fox jumps over the lazy dog " * 6
+    plain = quickpdf.html_to_pdf(f"<div>{body}</div>")
+    styled = quickpdf.html_to_pdf(
+        "<style>#wrap { font-size: 36px; }</style>"
+        f"<div id='wrap'>{body}<p>child</p></div>"
+    )
+    plain_lines = _pdf_text(plain).strip().count("\n") + 1
+    styled_lines = _pdf_text(styled).strip().count("\n") + 1
+    # Anonymous paragraph carrying the orphan body must be rendered at the
+    # parent's 36px size, producing more wrapped lines than the unstyled div.
+    assert styled_lines > plain_lines, (
+        f"anon paragraph should pick up parent's #wrap style "
+        f"(plain={plain_lines}, styled={styled_lines})"
+    )
