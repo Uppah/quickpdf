@@ -1109,4 +1109,22 @@ mod tests {
         assert!(pi.h <= 764.0 + 0.01, "expected h ≤ 764pt, got {}", pi.h);
         assert!((pi.w - pi.h).abs() < 0.5, "aspect must be preserved");
     }
+
+    #[test]
+    fn img_with_background_color_emits_box_around_image() {
+        let html = format!(
+            r#"<style>img {{ background-color: yellow; padding: 6px; }}</style>
+<img src="data:image/png;base64,{}" width="40" height="20">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        assert_eq!(pages[0].images.len(), 1);
+        assert_eq!(pages[0].boxes.len(), 1, "expected one decoration box");
+        let b = &pages[0].boxes[0];
+        assert_eq!(b.fill, Some(Color::rgb(255, 255, 0)));
+        // Padding pushes the image inward by 6pt on each axis.
+        let img = &pages[0].images[0];
+        assert!((img.x - (b.x + 6.0)).abs() < 0.5);
+        assert!((img.w - 40.0).abs() < 0.5);
+    }
 }
