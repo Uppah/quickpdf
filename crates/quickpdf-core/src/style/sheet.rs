@@ -72,12 +72,16 @@ pub fn parse_inline_declarations(source: &str) -> Vec<Declaration> {
     parse_declaration_block(source)
 }
 
-/// Parse a stylesheet source string into a flat rule list. Always returns —
-/// malformed rules are silently skipped (browsers do the same).
-pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
+/// Parse a stylesheet source string into a `Stylesheet` aggregate
+/// containing both qualified rules and `@font-face` blocks. Always
+/// returns — malformed rules are silently skipped (browsers do the
+/// same). Phase 2b's font registry consumes the `font_faces` field;
+/// the cascade consumes `rules` exactly as before.
+pub fn parse_stylesheet_full(source: &str) -> Stylesheet {
     let bytes = source.as_bytes();
     let mut pos = 0;
     let mut rules: Vec<Rule> = Vec::new();
+    let mut font_faces: Vec<FontFace> = Vec::new();
     let mut order: usize = 0;
 
     while pos < bytes.len() {
@@ -86,9 +90,18 @@ pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
             break;
         }
 
-        // At-rule? Skip the entire prelude + optional block.
+        // At-rule? `@font-face` is captured; everything else is dropped.
         if bytes[pos] == b'@' {
-            pos = skip_at_rule(bytes, pos);
+            match try_capture_font_face(source, bytes, pos, order) {
+                Some((face, next_pos)) => {
+                    font_faces.push(face);
+                    pos = next_pos;
+                    order += 1;
+                }
+                None => {
+                    pos = skip_at_rule(bytes, pos);
+                }
+            }
             continue;
         }
 
@@ -114,14 +127,36 @@ pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
             None => {
                 // Couldn't find a `{` matching the prelude — input ran out
                 // without a block opener. Treat the rest of the stream as
-                // malformed and stop. (e.g. "broken {" with no closer, or
-                // trailing junk like "; foo" at EOF.)
+                // malformed and stop.
                 break;
             }
         }
     }
 
-    rules
+    Stylesheet { rules, font_faces }
+}
+
+/// Back-compat wrapper. Existing callers and ~30 unit tests in this
+/// file consume `Vec<Rule>` directly; this preserves their contract.
+/// New callers should prefer `parse_stylesheet_full` for the aggregate.
+pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
+    parse_stylesheet_full(source).rules
+}
+
+/// Try to recognise an `@font-face` rule starting at `bytes[pos] == b'@'`.
+/// Returns `Some((face, next_pos))` on a successful capture, or `None`
+/// if this isn't an `@font-face` rule (or it's malformed) — in which
+/// case the caller falls back to `skip_at_rule` to consume it.
+///
+/// Phase 2b Task 5 wires up the real recogniser. Until then this stub
+/// always returns `None` so existing behavior is unchanged.
+fn try_capture_font_face(
+    _source: &str,
+    _bytes: &[u8],
+    _pos: usize,
+    _source_order: usize,
+) -> Option<(FontFace, usize)> {
+    None
 }
 
 /// Walk the parsed HTML and return the concatenated text content of every
@@ -1239,5 +1274,26 @@ mod tests {
         assert_eq!(d[4].value, "8px");
         assert_eq!(d[5].name, "font-size");
         assert_eq!(d[5].value, "12px");
+    }
+
+    // ---- Phase 2b Slice A: Stylesheet aggregate. ----
+
+    #[test]
+    fn parse_stylesheet_full_empty_returns_empty_aggregate() {
+        let sheet = parse_stylesheet_full("");
+        assert!(sheet.rules.is_empty());
+        assert!(sheet.font_faces.is_empty());
+    }
+
+    #[test]
+    fn parse_stylesheet_full_rules_match_legacy_parse_stylesheet() {
+        let src = "h1 { font-size: 24px; } p { font-size: 12px; }";
+        let aggregate = parse_stylesheet_full(src);
+        let legacy = parse_stylesheet(src);
+        assert_eq!(aggregate.rules.len(), legacy.len());
+        for (a, l) in aggregate.rules.iter().zip(legacy.iter()) {
+            assert_eq!(a.selector_text, l.selector_text);
+            assert_eq!(a.source_order, l.source_order);
+        }
     }
 }
