@@ -4,6 +4,7 @@
 //! Real cascade + block/inline layout + text shaping land in Phases 1.2–1.5.
 
 pub mod font;
+pub mod image;
 pub mod parse;
 pub mod style;
 pub mod text;
