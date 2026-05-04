@@ -92,6 +92,16 @@ impl Color {
 pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle {
     let mut out = base;
     for decl in decls {
+        // font-family is handled directly (not via parse_value) because its
+        // return type (Option<Vec<String>>) doesn't fit the ParsedValue enum.
+        if decl.name == "font-family" {
+            if let Some(chain) = parse_font_family(&decl.value) {
+                out.font_family = Some(chain);
+            }
+            // Empty/all-generic value: leave inherited value intact
+            // by NOT writing None.
+            continue;
+        }
         let Some(parsed) = parse_value(&decl.name, &decl.value) else {
             continue;
         };
@@ -1095,6 +1105,52 @@ mod tests {
             parse_font_family("ACME, Helvetica"),
             Some(vec!["acme".to_string(), "helvetica".to_string()])
         );
+    }
+
+    /// Helper: apply a single declaration to BlockStyle::DEFAULT and
+    /// return the resulting style. (Mirrors the helpers used by the
+    /// existing `*_value_parsers_apply` tests.)
+    fn apply_one(name: &str, value: &str) -> BlockStyle {
+        let decl = crate::style::sheet::Declaration {
+            name: name.to_string(),
+            value: value.to_string(),
+            important: false,
+        };
+        apply_declarations(BlockStyle::DEFAULT, &[decl])
+    }
+
+    #[test]
+    fn font_family_apply_sets_block_style() {
+        let style = apply_one("font-family", "\"Acme\", Helvetica");
+        assert_eq!(
+            style.font_family,
+            Some(vec!["acme".to_string(), "helvetica".to_string()])
+        );
+    }
+
+    #[test]
+    fn font_family_apply_empty_value_keeps_none() {
+        let style = apply_one("font-family", "");
+        assert!(style.font_family.is_none());
+    }
+
+    #[test]
+    fn font_family_inherits_when_child_has_none() {
+        let mut parent = BlockStyle::DEFAULT;
+        parent.font_family = Some(vec!["acme".to_string()]);
+        let child = BlockStyle::DEFAULT;
+        let resolved = inherit(&parent, child);
+        assert_eq!(resolved.font_family, Some(vec!["acme".to_string()]));
+    }
+
+    #[test]
+    fn font_family_child_value_wins_over_parent() {
+        let mut parent = BlockStyle::DEFAULT;
+        parent.font_family = Some(vec!["acme".to_string()]);
+        let mut child = BlockStyle::DEFAULT;
+        child.font_family = Some(vec!["beta".to_string()]);
+        let resolved = inherit(&parent, child);
+        assert_eq!(resolved.font_family, Some(vec!["beta".to_string()]));
     }
 
     // ---- Phase 2a Slice C: width / height longhands. ----
