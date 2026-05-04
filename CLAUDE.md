@@ -30,13 +30,13 @@ something genuinely new, not another browser wrapper.
 | 1.6c  |   ✓    | Specificity, `!important`, inheritance via parent-chain walk, anonymous-block wrap   |
 | 1.7a  |   ✓    | `color` property: parser (named/hex/rgb/rgba), inherited, plumbed into krilla fill   |
 | 1.7b  |   ✓    | `background-color`, `padding-*`, `border-*` via PlacedBox paint pass                 |
-| 1.7c  |   →    | **NEXT.** Length extensions (`rem`, padding/margin shorthand) + inline `style="..."` |
-|   2   |        | Tables, images, web fonts → renders email-style HTML                                 |
+| 1.7c  |   ✓    | `rem` unit, padding/margin/border shorthand, inline `style="..."` (4-tuple specificity) |
+|   2   |   →    | **NEXT.** Tables, images, web fonts → renders email-style HTML                       |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf` v0.1                        |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel                                   |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS                              |
 
-**Test posture today:** 124 Rust unit tests + 37 Python integration tests, all
+**Test posture today:** 161 Rust unit tests + 44 Python integration tests, all
 green in ~0.3 s combined.
 
 ## Build + test (always)
@@ -72,14 +72,14 @@ quickpdf/
 │   │   ├── assets/fonts/Inter-Regular.ttf  ← bundled, OFL-licensed
 │   │   └── src/
 │   │       ├── lib.rs               # html_to_pdf entrypoint + plan_pages_styled
-│   │       ├── parse.rs             # html5ever DOM walker, paragraphs(), Document
+│   │       ├── parse.rs             # html5ever DOM walker, paragraphs(), inline_styles()
 │   │       ├── font.rs              # FALLBACK_TTF (include_bytes!)
 │   │       ├── text.rs              # TextMetrics, wrap_lines (greedy word-wrap)
-│   │       └── style/               # CSS pipeline (Phase 1.6 family)
-│   │           ├── mod.rs           # BlockStyle, ua_style, resolve (cascade + inherit)
-│   │           ├── sheet.rs         # CSS parser → Vec<Rule>; !important stripping
-│   │           ├── matcher.rs       # selector parse + match + Specificity
-│   │           └── cascade.rs       # apply_declarations, BlockStyleBuilder, inherit
+│   │       └── style/               # CSS pipeline (Phase 1.6 + 1.7 family)
+│   │           ├── mod.rs           # BlockStyle, ua_style, resolve, InlineStyles
+│   │           ├── sheet.rs         # CSS parser → Vec<Rule>; shorthand expansion; inline parser
+│   │           ├── matcher.rs       # selector parse + match + Specificity (4-tuple)
+│   │           └── cascade.rs       # apply_declarations, parse_length_em (rem-aware), BlockStyleBuilder, inherit
 │   └── quickpdf-py/                 # PyO3 cdylib → quickpdf._native
 │       └── src/lib.rs               # html_to_pdf binding + debug helpers
 ├── python/quickpdf/
@@ -131,26 +131,39 @@ quickpdf/
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next
   to it and **must be preserved on any redistribution**.
 
-## Next session: Phase 1.7c
+## Next session: Phase 2
 
-Phases 1.7a (colour) and 1.7b (box-model paint: bg-color, padding, border)
-are done. Phase 1.7c adds length-parsing breadth and inline `style="..."`:
+Phase 1.7 is complete. Phase 2 begins the "renders email-style HTML"
+push: tables (`<table>`/`<tr>`/`<td>`), images (`<img>` with raster +
+data URLs), and web fonts (`@font-face`).
 
-1. **`rem` units.** `parse_length_em` currently knows `px`/`pt`/`em`/`%`;
-   add `rem` resolved against the document's root font-size. Phase 1.7c
-   can hard-code root = 1em until a proper `:root` cascade lands.
-2. **Padding/margin shorthand.** `padding: 10px` (one value) → all sides;
-   `padding: 10px 20px` → top/bottom + left/right; `padding: 10px 20px
-   30px` → top + L/R + bottom; `padding: 10px 20px 30px 40px` → t/r/b/l.
-   Same for `margin`. Implementation note: a shorthand expands into the
-   four longhand declarations at parse time so the cascade stays uniform.
-3. **`border` shorthand.** `border: 1px solid red` parses width + style
-   + colour in any order, expands to the three longhands.
-4. **Inline `style="..."` attribute.** Walk the DOM in `parse.rs`, harvest
-   each element's `style` attr, return a list of `(NodeId, declarations)`.
-   The integrator threads them into `style::resolve` with specificity
-   bumped to a fourth bucket (1, 0, 0, 0) — extend `Specificity` to
-   `(u32, u32, u32, u32)` (a, b, c, d) where `a = inline-style count`.
+- **Tables** are the first feature where layout actually has to compute
+  a 2D box geometry rather than stacking blocks. Plan ahead: `taffy`
+  is the obvious crate, but a hand-rolled fixed-table-layout pass may
+  ship faster for the email-template subset.
+- **Images** mean adding a decoder dependency (`image` crate) and
+  teaching krilla about pixel buffers. Data URLs (`data:image/...`)
+  come for free once the decoder is wired.
+- **Web fonts** require parsing `@font-face` (currently dropped by the
+  at-rule skipper in `sheet.rs::skip_at_rule`) and threading custom
+  `Font` instances through the planner.
+
+Cross-cutting Phase 1.7c artefacts to keep in mind for future phases:
+
+- `Specificity` is now a 4-tuple `(inline, id, class, tag)` with
+  `Specificity::INLINE = (1, 0, 0, 0)`. New cascade origins should pick
+  a slot above bucket 0 if needed (CSS spec: user-agent < user < author,
+  with !important reversing among origins). For now everything shares
+  the author-bucket sort order.
+- `style::InlineStyles<'a>` is the seam between `parse::Document::inline_styles()`
+  and the cascade. The integrator builds this map once per render and
+  threads it through `plan_pages_styled`.
+- Shorthand expansion happens at parse time inside
+  `sheet::parse_declaration_block`, so author rules and inline styles
+  both feed only longhand declarations into the cascade. Adding a new
+  shorthand is one helper plus a handful of tests; no cascade work needed.
+- `rem` resolves to `1em` until `:root` cascade lands. Phase 4 should
+  add proper `:root font-size` resolution.
 
 Known 1.7b limitation worth fixing later: a decorated block taller than
 a single page falls back to streaming-without-box. Phase 4 adds proper

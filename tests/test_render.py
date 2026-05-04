@@ -492,3 +492,99 @@ def test_border_style_none_suppresses_stroke():
     import re
     rg_op = re.compile(r"(?:^|\n)\s*\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+RG\b")
     assert not rg_op.search(streams), "border-style:none must suppress RG op"
+
+
+# --- Phase 1.7c: inline style="...", rem unit, shorthand expansion ---------
+
+def test_inline_style_attribute_sets_color():
+    pdf = quickpdf.html_to_pdf('<p style="color: red">x</p>')
+    streams = _pdf_content_streams(pdf)
+    assert "1 0 0 rg" in streams, "inline style=color:red must emit red fill"
+
+
+def test_inline_style_beats_author_rule():
+    # Author rule sets blue; inline style overrides to red. Specificity bucket
+    # 0 (inline) > bucket 3 (tag) so red must win.
+    pdf = quickpdf.html_to_pdf(
+        '<style>p { color: blue; }</style>'
+        '<p style="color: red">x</p>'
+    )
+    streams = _pdf_content_streams(pdf)
+    assert "1 0 0 rg" in streams, "inline style must beat author rule"
+    assert "0 0 1 rg" not in streams, "author blue must NOT appear"
+
+
+def test_inline_style_font_size_wraps_more_lines():
+    body = "the quick brown fox jumps over the lazy dog " * 4
+    plain = quickpdf.html_to_pdf(f"<p>{body}</p>")
+    big = quickpdf.html_to_pdf(f'<p style="font-size: 24px">{body}</p>')
+    plain_lines = _pdf_text(plain).strip().count("\n") + 1
+    big_lines = _pdf_text(big).strip().count("\n") + 1
+    assert big_lines > plain_lines, (
+        f"inline 24px font-size must enlarge text "
+        f"(plain={plain_lines}, big={big_lines})"
+    )
+
+
+def test_important_id_beats_inline_style():
+    # `!important` on a selector rule beats a non-important inline style,
+    # regardless of bucket-0 specificity. Author rule at 48px must dominate
+    # the inline 12px.
+    body = "the quick brown fox jumps over the lazy dog " * 6
+    pdf = quickpdf.html_to_pdf(
+        '<style>#x { font-size: 48px !important; }</style>'
+        f'<p id="x" style="font-size: 12px">{body}</p>'
+    )
+    line_count = _pdf_text(pdf).strip().count("\n") + 1
+    assert line_count >= 8, (
+        f"!important id must beat plain inline style "
+        f"(got {line_count} lines, expected ≥8 at 48px)"
+    )
+
+
+def test_rem_unit_resolves_for_font_size():
+    # 2rem at base 12pt → 24pt. Wraps more lines than baseline.
+    body = "the quick brown fox jumps over the lazy dog " * 4
+    plain = quickpdf.html_to_pdf(f"<p>{body}</p>")
+    rem = quickpdf.html_to_pdf(f'<p style="font-size: 2rem">{body}</p>')
+    plain_lines = _pdf_text(plain).strip().count("\n") + 1
+    rem_lines = _pdf_text(rem).strip().count("\n") + 1
+    assert rem_lines > plain_lines, (
+        f"2rem must wrap more lines than default (plain={plain_lines}, "
+        f"rem={rem_lines})"
+    )
+
+
+def test_padding_shorthand_one_value_pads_all_sides():
+    # padding:24px expands to all four longhands. We can observe padding-left
+    # via the same Tm-x technique used in 1.7b.
+    plain = quickpdf.html_to_pdf("<p>x</p>")
+    padded = quickpdf.html_to_pdf('<p style="padding: 24px">x</p>')
+    plain_streams = _pdf_content_streams(plain)
+    padded_streams = _pdf_content_streams(padded)
+    import re
+
+    def first_tm_x(s: str) -> float:
+        m = re.search(r"1 0 0 -1 (\S+) \S+ Tm", s)
+        assert m, f"no Tm op in {s!r}"
+        return float(m.group(1))
+
+    plain_x = first_tm_x(plain_streams)
+    padded_x = first_tm_x(padded_streams)
+    assert padded_x - plain_x > 20.0, (
+        f"padding:24px shorthand must shift text x by ~24pt: "
+        f"plain={plain_x}, padded={padded_x}"
+    )
+
+
+def test_border_shorthand_emits_stroke():
+    # `border: 2px solid red` should expand to width/style/color longhands.
+    pdf = quickpdf.html_to_pdf(
+        '<p style="border: 2px solid red">x</p>'
+    )
+    streams = _pdf_content_streams(pdf)
+    assert "1 0 0 RG" in streams, "border shorthand must emit red stroke"
+    assert "2 w" in streams, "border shorthand must emit stroke-width 2"
+    assert "\nS\n" in streams or " S\n" in streams, (
+        "border shorthand must emit path-stroke `S`"
+    )

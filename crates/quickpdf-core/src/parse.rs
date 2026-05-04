@@ -7,7 +7,7 @@ use scraper::{ElementRef, Html, Node};
 use scraper::node::Element;
 use ego_tree::NodeId;
 
-use crate::style::sheet::{self, Rule};
+use crate::style::sheet::{self, Declaration, Rule};
 
 /// Sentinel `Paragraph::tag` value for an anonymous block created by
 /// `collect_paragraphs` to wrap orphan inline content inside a container
@@ -92,6 +92,17 @@ impl Document {
     pub fn element_for(&self, p: &Paragraph) -> Option<ElementRef<'_>> {
         let node = self.html.tree.get(p.element_id)?;
         ElementRef::wrap(node)
+    }
+
+    /// Walk the DOM and return per-element inline `style="..."` declarations,
+    /// in document order. Skipped subtrees (script/style/head/noscript/template)
+    /// contribute nothing. Empty `style=""` attributes are dropped. Elements
+    /// whose `style` value parses to zero declarations are also dropped.
+    pub fn inline_styles(&self) -> Vec<(NodeId, Vec<Declaration>)> {
+        let mut out = Vec::new();
+        let root = self.html.root_element();
+        visit_inline_styles(root, &mut out);
+        out
     }
 }
 
@@ -262,6 +273,30 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
             text: collapsed,
             element_id: elem.id(),
         });
+    }
+}
+
+fn visit_inline_styles(
+    elem: ElementRef<'_>,
+    out: &mut Vec<(NodeId, Vec<Declaration>)>,
+) {
+    let name = elem.value().name();
+    if is_skipped(name) {
+        return;
+    }
+    if let Some(raw) = elem.value().attr("style") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let decls = sheet::parse_inline_declarations(trimmed);
+            if !decls.is_empty() {
+                out.push((elem.id(), decls));
+            }
+        }
+    }
+    for child in elem.children() {
+        if let Some(child_elem) = ElementRef::wrap(child) {
+            visit_inline_styles(child_elem, out);
+        }
     }
 }
 
@@ -538,5 +573,113 @@ mod tests {
                 (ANONYMOUS_TAG, "c"),
             ]
         );
+    }
+
+    // ---- Phase 1.7c Slice B: inline `style="..."` extraction tests. ----
+
+    #[test]
+    fn inline_styles_empty_for_no_style_attrs() {
+        let d = Document::parse("<p>plain</p><div>also plain</div>");
+        assert!(d.inline_styles().is_empty());
+    }
+
+    #[test]
+    fn inline_styles_collects_one_per_element() {
+        let d = Document::parse(r#"<p style="color: red">x</p>"#);
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].1.len(), 1);
+        assert_eq!(inline[0].1[0].name, "color");
+        assert_eq!(inline[0].1[0].value, "red");
+        assert!(!inline[0].1[0].important);
+    }
+
+    #[test]
+    fn inline_styles_skips_empty_style_attribute() {
+        let d = Document::parse(r#"<p style="">x</p>"#);
+        assert!(d.inline_styles().is_empty());
+    }
+
+    #[test]
+    fn inline_styles_skips_whitespace_only_style_attribute() {
+        let d = Document::parse(r#"<p style="   	  ">x</p>"#);
+        assert!(d.inline_styles().is_empty());
+    }
+
+    #[test]
+    fn inline_styles_in_document_order() {
+        let d = Document::parse(
+            r#"<p style="color: red">a</p><p style="color: blue">b</p><p style="color: green">c</p>"#,
+        );
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 3);
+        assert_eq!(inline[0].1[0].value, "red");
+        assert_eq!(inline[1].1[0].value, "blue");
+        assert_eq!(inline[2].1[0].value, "green");
+    }
+
+    #[test]
+    fn inline_styles_skipped_in_script_subtree() {
+        // The DOM allows the `style` attribute on a <script> tag in
+        // theory, but our walker treats <script> as a skipped subtree.
+        let d = Document::parse(
+            r#"<script style="color: red">var x = 1;</script><p style="color: blue">y</p>"#,
+        );
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].1[0].value, "blue");
+    }
+
+    #[test]
+    fn inline_styles_skipped_in_style_subtree() {
+        let d = Document::parse(
+            r#"<style style="color: red">p { color: green; }</style><p style="color: blue">y</p>"#,
+        );
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].1[0].value, "blue");
+    }
+
+    #[test]
+    fn inline_styles_handles_important() {
+        let d = Document::parse(r#"<p style="color: red !important">x</p>"#);
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].1.len(), 1);
+        assert_eq!(inline[0].1[0].name, "color");
+        assert_eq!(inline[0].1[0].value, "red");
+        assert!(inline[0].1[0].important);
+    }
+
+    #[test]
+    fn inline_styles_node_id_resolves_via_element_for() {
+        // Build a synthetic Paragraph with the inline-style NodeId and
+        // confirm element_for round-trips back to the right element.
+        let d = Document::parse(r#"<p style="color: red">x</p>"#);
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        let node_id = inline[0].0;
+        let synthetic = Paragraph {
+            tag: "p".to_string(),
+            text: "x".to_string(),
+            element_id: node_id,
+        };
+        let resolved = d.element_for(&synthetic).expect("node id resolves");
+        assert_eq!(resolved.value().name(), "p");
+        // The resolved element's own NodeId matches the one we collected.
+        assert_eq!(resolved.id(), node_id);
+    }
+
+    #[test]
+    fn inline_styles_drops_unparseable_into_zero_decls() {
+        // `style="garbage"` has no `:`, so parse_inline_declarations returns
+        // an empty Vec and the element is dropped from the result.
+        let d = Document::parse(
+            r#"<p style="garbage no colons here">x</p><span style="color: red">y</span>"#,
+        );
+        let inline = d.inline_styles();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].1[0].name, "color");
+        assert_eq!(inline[0].1[0].value, "red");
     }
 }

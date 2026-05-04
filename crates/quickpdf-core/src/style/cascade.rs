@@ -12,8 +12,9 @@
 //! - `Npx`  → `LengthEm(N / 12.0)`  (CSS 12 px ≈ 1 em at our base)
 //! - `Npt`  → `LengthEm(N / 12.0)`  (12 pt = 1 em)
 //! - `Nem`  → `LengthEm(N)`
+//! - `Nrem` → `LengthEm(N)`        (root font-size = 1em until `:root` cascade lands)
 //! - `N%`   → `LengthEm(N / 100.0)`
-//! - everything else (`rem`, `ex`, `vh`, …) → `None`
+//! - everything else (`ex`, `vh`, …) → `None`
 //!
 //! # `font-weight`
 //!
@@ -175,6 +176,10 @@ fn parse_length_em(value: &str) -> Option<f32> {
         (n, 12.0_f32)
     } else if let Some(n) = value.strip_suffix("pt") {
         (n, 12.0_f32)
+    } else if let Some(n) = value.strip_suffix("rem") {
+        // Root font-size = 1em until a real `:root` cascade lands, so `rem`
+        // is currently identical to `em`. See CLAUDE.md Phase 1.7c.
+        (n, 1.0_f32)
     } else if let Some(n) = value.strip_suffix("em") {
         (n, 1.0_f32)
     } else if let Some(n) = value.strip_suffix('%') {
@@ -474,7 +479,41 @@ mod tests {
             parse_value("font-size", "150%"),
             Some(ParsedValue::LengthEm(1.5))
         );
-        assert_eq!(parse_value("font-size", "5rem"), None);
+        assert_eq!(
+            parse_value("font-size", "5rem"),
+            Some(ParsedValue::LengthEm(5.0))
+        );
+    }
+
+    #[test]
+    fn parses_rem_alongside_em() {
+        // 1rem and 1em are currently identical (root font-size = 1em).
+        assert_eq!(
+            parse_value("font-size", "1rem"),
+            Some(ParsedValue::LengthEm(1.0))
+        );
+        assert_eq!(
+            parse_value("font-size", "2.5rem"),
+            Some(ParsedValue::LengthEm(2.5))
+        );
+        assert_eq!(
+            parse_value("font-size", "0rem"),
+            Some(ParsedValue::LengthEm(0.0))
+        );
+        // Negative values are syntactically fine; the cascade itself may or
+        // may not clamp depending on property semantics.
+        assert_eq!(
+            parse_value("font-size", "-0.5rem"),
+            Some(ParsedValue::LengthEm(-0.5))
+        );
+        // rem and em produce the same em-value at root scope.
+        assert_eq!(
+            parse_value("padding-top", "1rem"),
+            parse_value("padding-top", "1em"),
+        );
+        // Garbage rem still rejected.
+        assert_eq!(parse_value("font-size", "remmy"), None);
+        assert_eq!(parse_value("font-size", "rem"), None);
     }
 
     #[test]

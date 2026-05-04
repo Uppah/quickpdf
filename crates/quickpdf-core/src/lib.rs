@@ -126,6 +126,11 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
     let parsed = parse::Document::parse(html);
     let paragraphs = parsed.paragraphs();
     let user_rules = parsed.user_stylesheet();
+    let inline_owned = parsed.inline_styles();
+    let inline_map: style::InlineStyles<'_> = inline_owned
+        .iter()
+        .map(|(id, decls)| (*id, decls.as_slice()))
+        .collect();
 
     let font = Font::new(font::FALLBACK_TTF.to_vec().into(), 0)
         .ok_or_else(|| Error::Pdf("could not load embedded fallback font".into()))?;
@@ -142,6 +147,7 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
         &parsed,
         &paragraphs,
         &user_rules,
+        &inline_map,
         content_width,
         MARGIN_PT,
         bottom_limit,
@@ -265,6 +271,7 @@ fn plan_pages_styled(
     doc: &parse::Document,
     paragraphs: &[parse::Paragraph],
     user_rules: &[style::sheet::Rule],
+    inline: &style::InlineStyles<'_>,
     content_width: f32,
     left_margin: f32,
     bottom_limit: f32,
@@ -278,7 +285,7 @@ fn plan_pages_styled(
 
     for para in paragraphs {
         let style = match doc.element_for(para) {
-            Some(elem) => style::resolve(elem, user_rules),
+            Some(elem) => style::resolve(elem, user_rules, inline),
             None => style::ua_style(&para.tag),
         };
         let font_size = DEFAULT_FONT_SIZE_PT * style.font_size_em;
@@ -413,7 +420,12 @@ mod tests {
         let doc = parse::Document::parse(html);
         let paragraphs = doc.paragraphs();
         let rules = doc.user_stylesheet();
-        plan_pages_styled(&doc, &paragraphs, &rules, 500.0, 36.0, 800.0).unwrap()
+        let inline_owned = doc.inline_styles();
+        let inline_map: style::InlineStyles<'_> = inline_owned
+            .iter()
+            .map(|(id, decls)| (*id, decls.as_slice()))
+            .collect();
+        plan_pages_styled(&doc, &paragraphs, &rules, &inline_map, 500.0, 36.0, 800.0).unwrap()
     }
 
     #[test]
@@ -710,5 +722,60 @@ mod tests {
         let b = &pages[0].boxes[0];
         assert!((b.x - 36.0).abs() < 0.01, "box x should be left margin: {}", b.x);
         assert!((b.w - 500.0).abs() < 0.01, "box w should be content width: {}", b.w);
+    }
+
+    // ---- Phase 1.7c: inline style="..." flows through the planner.
+
+    #[test]
+    fn inline_style_color_overrides_default() {
+        let pages = plan(r#"<p style="color: red">x</p>"#);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert_eq!(line.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn inline_style_font_size_overrides_default() {
+        let pages = plan(r#"<p style="font-size: 24px">x</p>"#);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert!(
+            (line.font_size_pt - 24.0).abs() < 0.01,
+            "expected 24pt from inline style, got {}",
+            line.font_size_pt
+        );
+    }
+
+    #[test]
+    fn inline_style_beats_author_rule() {
+        let pages = plan(
+            r#"<style>p { color: blue; }</style><p style="color: red">x</p>"#,
+        );
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert_eq!(line.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn inline_padding_shorthand_expands_and_applies() {
+        // Single-value padding shorthand → all four sides; padding-left
+        // shifts text origin by the same amount as padding-left longhand.
+        let plain = plan_full("<p>x</p>");
+        let padded = plan_full(r#"<p style="padding: 24px">x</p>"#);
+        let plain_x = plain[0].lines[0].x;
+        let padded_x = padded[0].lines[0].x;
+        assert!(
+            (padded_x - plain_x - 24.0).abs() < 0.5,
+            "inline padding:24px should shift x by ~24pt (got {plain_x} vs {padded_x})"
+        );
+    }
+
+    #[test]
+    fn rem_unit_resolves_against_base_font_size() {
+        // 2rem at base 12pt → 24pt. Until :root cascade lands, rem == em.
+        let pages = plan(r#"<p style="font-size: 2rem">x</p>"#);
+        let line = pages[0].iter().find(|l| l.text == "x").unwrap();
+        assert!(
+            (line.font_size_pt - 24.0).abs() < 0.01,
+            "expected 2rem → 24pt, got {}",
+            line.font_size_pt
+        );
     }
 }

@@ -35,21 +35,27 @@ pub struct Selector {
     pub compounds: Vec<Compound>,
 }
 
-/// CSS Selectors Level 3 specificity.
+/// CSS Selectors Level 3 specificity, extended with an inline-style bucket.
 ///
-/// - `0` = number of ID selectors.
-/// - `1` = number of class selectors.
-/// - `2` = number of type/tag selectors.
+/// - `0` (a) = inline-style flag (0 or 1). Set by [`Specificity::INLINE`]
+///   for declarations harvested from an element's `style="..."` attribute;
+///   selector-derived specificity always leaves this bucket at 0.
+/// - `1` (b) = number of ID selectors.
+/// - `2` (c) = number of class selectors.
+/// - `3` (d) = number of type/tag selectors.
 ///
 /// Universal selector (`*`) and combinators contribute nothing.
 ///
-/// `Ord`/`PartialOrd` compare lexicographically: id beats class beats tag,
-/// so `(1,0,0) > (0,99,0) > (0,0,99)`.
+/// `Ord`/`PartialOrd` compare lexicographically: inline beats id beats class
+/// beats tag, so `INLINE > (0,1,0,0) > (0,0,99,0) > (0,0,0,99)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Specificity(pub u32, pub u32, pub u32);
+pub struct Specificity(pub u32, pub u32, pub u32, pub u32);
 
 impl Specificity {
-    pub const ZERO: Specificity = Specificity(0, 0, 0);
+    pub const ZERO: Specificity = Specificity(0, 0, 0, 0);
+    /// Sentinel for an inline `style="..."` declaration. Always beats
+    /// any selector-based rule of equal `important` rank.
+    pub const INLINE: Specificity = Specificity(1, 0, 0, 0);
 }
 
 /// Parse a comma-separated selector list. Each comma yields one `Selector`.
@@ -72,20 +78,23 @@ pub fn parse_selector_list(input: &str) -> Vec<Selector> {
 /// Compute the CSS specificity of a `Selector`. Sums simples across
 /// **every** compound in the selector's chain (descendant combinator does
 /// not change the count — `div p` has the same specificity as `p p`).
+///
+/// Selector-derived specificity always leaves the inline bucket (a) at 0;
+/// only [`Specificity::INLINE`] sets it.
 pub fn specificity(selector: &Selector) -> Specificity {
-    let mut a = 0u32;
     let mut b = 0u32;
     let mut c = 0u32;
+    let mut d = 0u32;
     for compound in &selector.compounds {
         for part in &compound.parts {
             match part {
-                SimpleSelector::Id(_) => a += 1,
-                SimpleSelector::Class(_) => b += 1,
-                SimpleSelector::Tag(_) => c += 1,
+                SimpleSelector::Id(_) => b += 1,
+                SimpleSelector::Class(_) => c += 1,
+                SimpleSelector::Tag(_) => d += 1,
             }
         }
     }
-    Specificity(a, b, c)
+    Specificity(0, b, c, d)
 }
 
 /// Parse a single (already-trimmed, non-empty) selector. Returns `None` if
@@ -339,40 +348,40 @@ mod tests {
 
     #[test]
     fn specificity_tag_only_is_one_in_c() {
-        assert_eq!(specificity(&one("p")), Specificity(0, 0, 1));
+        assert_eq!(specificity(&one("p")), Specificity(0, 0, 0, 1));
     }
 
     #[test]
     fn specificity_class_only_is_one_in_b() {
-        assert_eq!(specificity(&one(".foo")), Specificity(0, 1, 0));
+        assert_eq!(specificity(&one(".foo")), Specificity(0, 0, 1, 0));
     }
 
     #[test]
     fn specificity_id_only_is_one_in_a() {
-        assert_eq!(specificity(&one("#bar")), Specificity(1, 0, 0));
+        assert_eq!(specificity(&one("#bar")), Specificity(0, 1, 0, 0));
     }
 
     #[test]
     fn specificity_compound_sums_parts() {
-        assert_eq!(specificity(&one("p.foo#bar")), Specificity(1, 1, 1));
+        assert_eq!(specificity(&one("p.foo#bar")), Specificity(0, 1, 1, 1));
     }
 
     #[test]
     fn specificity_descendant_sums_compounds() {
-        assert_eq!(specificity(&one("div p")), Specificity(0, 0, 2));
-        assert_eq!(specificity(&one("div p .x")), Specificity(0, 1, 2));
+        assert_eq!(specificity(&one("div p")), Specificity(0, 0, 0, 2));
+        assert_eq!(specificity(&one("div p .x")), Specificity(0, 0, 1, 2));
     }
 
     #[test]
     fn specificity_id_beats_class_beats_tag() {
-        assert!(Specificity(1, 0, 0) > Specificity(0, 99, 0));
-        assert!(Specificity(0, 1, 0) > Specificity(0, 0, 99));
+        assert!(Specificity(0, 1, 0, 0) > Specificity(0, 0, 99, 0));
+        assert!(Specificity(0, 0, 1, 0) > Specificity(0, 0, 0, 99));
     }
 
     #[test]
     fn specificity_lexicographic_within_bucket() {
-        assert!(Specificity(1, 2, 3) < Specificity(1, 2, 4));
-        assert!(Specificity(1, 2, 3) < Specificity(1, 3, 0));
+        assert!(Specificity(0, 1, 2, 3) < Specificity(0, 1, 2, 4));
+        assert!(Specificity(0, 1, 2, 3) < Specificity(0, 1, 3, 0));
     }
 
     #[test]
@@ -383,6 +392,16 @@ mod tests {
 
     #[test]
     fn specificity_multi_id_multi_class() {
-        assert_eq!(specificity(&one("#a #b .c.d e")), Specificity(2, 2, 1));
+        assert_eq!(specificity(&one("#a #b .c.d e")), Specificity(0, 2, 2, 1));
+    }
+
+    #[test]
+    fn specificity_inline_constant_beats_any_selector() {
+        assert!(Specificity::INLINE > Specificity(0, 999, 999, 999));
+    }
+
+    #[test]
+    fn specificity_default_zero_matches_const() {
+        assert_eq!(Specificity::default(), Specificity::ZERO);
     }
 }

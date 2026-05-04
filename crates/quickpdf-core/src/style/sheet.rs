@@ -36,6 +36,14 @@ pub struct Declaration {
     pub important: bool,
 }
 
+/// Parse the body of an inline `style="..."` attribute into a flat list of
+/// declarations. Behaves identically to a `<style>` block's body: comments
+/// are stripped, declarations are split on top-level `;`, and `!important`
+/// is honoured. Used by `parse::Document::inline_styles`.
+pub fn parse_inline_declarations(source: &str) -> Vec<Declaration> {
+    parse_declaration_block(source)
+}
+
 /// Parse a stylesheet source string into a flat rule list. Always returns —
 /// malformed rules are silently skipped (browsers do the same).
 pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
@@ -329,7 +337,239 @@ fn parse_declaration_block(body: &str) -> Vec<Declaration> {
             important,
         });
     }
+    // Phase 1.7c: expand `padding`, `margin`, and `border` shorthands into
+    // their per-side / per-component longhands so the cascade stays uniform.
+    expand_shorthands(out)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1.7c: shorthand expansion.
+//
+// `padding` / `margin` / `border` are recognised here. Each shorthand is
+// replaced by its longhands; unparseable shorthands are silently dropped.
+// Each generated longhand inherits the original shorthand's `important`
+// flag. The expansion runs after the initial declaration parse so callers
+// of `parse_declaration_block` (and the public inline-style wrapper) only
+// ever see longhands.
+// ---------------------------------------------------------------------------
+
+/// Replace any shorthand declaration in `decls` with its longhand expansion.
+/// Non-shorthand declarations pass through unchanged. An unparseable
+/// shorthand is dropped entirely (consistent with how malformed input
+/// disappears elsewhere in this file).
+fn expand_shorthands(decls: Vec<Declaration>) -> Vec<Declaration> {
+    let mut out: Vec<Declaration> = Vec::with_capacity(decls.len());
+    for decl in decls {
+        match decl.name.as_str() {
+            "padding" => {
+                if let Some(longhands) =
+                    expand_padding_or_margin_shorthand("padding", &decl.value, decl.important)
+                {
+                    out.extend(longhands);
+                }
+            }
+            "margin" => {
+                if let Some(longhands) =
+                    expand_padding_or_margin_shorthand("margin", &decl.value, decl.important)
+                {
+                    out.extend(longhands);
+                }
+            }
+            "border" => {
+                if let Some(longhands) = expand_border_shorthand(&decl.value, decl.important) {
+                    out.extend(longhands);
+                }
+            }
+            _ => out.push(decl),
+        }
+    }
     out
+}
+
+/// Split a shorthand value on whitespace at parenthesis depth 0. So
+/// `rgb(0, 0, 0) solid 1px` produces three components, not five.
+///
+/// Strings (`"..."`/`'...'`) appear in zero real-world shorthand values,
+/// so this implementation deliberately treats quote bytes as ordinary
+/// characters; the parser elsewhere in this file already handles strings
+/// in declaration values. If a future shorthand grows a string component,
+/// extend this helper.
+fn split_shorthand_values(value: &str) -> Vec<String> {
+    let bytes = value.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b == b'(' {
+            depth += 1;
+            if start.is_none() {
+                start = Some(pos);
+            }
+            pos += 1;
+        } else if b == b')' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            if start.is_none() {
+                start = Some(pos);
+            }
+            pos += 1;
+        } else if depth == 0 && is_css_ws(b) {
+            if let Some(s) = start.take() {
+                out.push(value[s..pos].to_string());
+            }
+            pos += 1;
+        } else {
+            if start.is_none() {
+                start = Some(pos);
+            }
+            pos += 1;
+        }
+    }
+    if let Some(s) = start.take() {
+        out.push(value[s..].to_string());
+    }
+    out
+}
+
+/// Expand a `padding` or `margin` shorthand value into 4 longhand
+/// declarations (`<prefix>-top`, `-right`, `-bottom`, `-left`). Returns
+/// `None` for >4 components or 0 components. The cascade rejects bad
+/// length tokens later, so the expansion does not validate values.
+fn expand_padding_or_margin_shorthand(
+    prefix: &str,
+    value: &str,
+    important: bool,
+) -> Option<Vec<Declaration>> {
+    let parts = split_shorthand_values(value);
+    let (t, r, b, l): (&str, &str, &str, &str) = match parts.len() {
+        1 => (
+            parts[0].as_str(),
+            parts[0].as_str(),
+            parts[0].as_str(),
+            parts[0].as_str(),
+        ),
+        2 => (
+            parts[0].as_str(),
+            parts[1].as_str(),
+            parts[0].as_str(),
+            parts[1].as_str(),
+        ),
+        3 => (
+            parts[0].as_str(),
+            parts[1].as_str(),
+            parts[2].as_str(),
+            parts[1].as_str(),
+        ),
+        4 => (
+            parts[0].as_str(),
+            parts[1].as_str(),
+            parts[2].as_str(),
+            parts[3].as_str(),
+        ),
+        _ => return None,
+    };
+    let mk = |side: &str, v: &str| Declaration {
+        name: format!("{prefix}-{side}"),
+        value: v.to_string(),
+        important,
+    };
+    Some(vec![
+        mk("top", t),
+        mk("right", r),
+        mk("bottom", b),
+        mk("left", l),
+    ])
+}
+
+/// Expand a `border` shorthand value (e.g. `1px solid red`) into up to
+/// three longhand declarations (`border-width`, `border-style`,
+/// `border-color`). Components may appear in any order. Returns `None`
+/// only if no recognised component is present (so the whole shorthand is
+/// dropped).
+///
+/// Recognition rules:
+///   - A token that ends with a known length unit (`px`, `pt`, `em`,
+///     `rem`, `%`) is treated as `border-width`. Bare `0` also counts.
+///   - A token equal to `solid`, `none`, or `hidden` is treated as
+///     `border-style`.
+///   - Anything else (including `rgb(...)` blobs) tentatively becomes
+///     `border-color`. The cascade's `parse_color` rejects garbage, so an
+///     unparseable colour just no-ops at apply time.
+///
+/// At most one of each component is emitted; later occurrences of the same
+/// component replace earlier ones (matches CSS shorthand semantics where
+/// the rightmost token wins).
+fn expand_border_shorthand(value: &str, important: bool) -> Option<Vec<Declaration>> {
+    let parts = split_shorthand_values(value);
+    if parts.is_empty() {
+        return None;
+    }
+    let mut width: Option<String> = None;
+    let mut style: Option<String> = None;
+    let mut color: Option<String> = None;
+    for part in &parts {
+        if looks_like_border_length(part) {
+            width = Some(part.clone());
+        } else if matches!(part.as_str(), "solid" | "none" | "hidden") {
+            style = Some(part.clone());
+        } else {
+            color = Some(part.clone());
+        }
+    }
+    // A "recognised" component is a length or a style keyword. A bare colour
+    // word ("red", "foo", "#abc") on its own is too ambiguous — without any
+    // disambiguating length-or-style token, the whole shorthand is dropped.
+    if width.is_none() && style.is_none() {
+        return None;
+    }
+    let mut out: Vec<Declaration> = Vec::new();
+    if let Some(v) = width {
+        out.push(Declaration {
+            name: "border-width".to_string(),
+            value: v,
+            important,
+        });
+    }
+    if let Some(v) = style {
+        out.push(Declaration {
+            name: "border-style".to_string(),
+            value: v,
+            important,
+        });
+    }
+    if let Some(v) = color {
+        out.push(Declaration {
+            name: "border-color".to_string(),
+            value: v,
+            important,
+        });
+    }
+    Some(out)
+}
+
+/// Heuristic: does this token look like a CSS length suitable for
+/// `border-width`? Mirrors the unit set accepted by
+/// `cascade::parse_length_em` (`px`, `pt`, `em`, `rem`, `%`). A bare `0`
+/// is also treated as a length so `border: 0 solid` works.
+fn looks_like_border_length(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t == "0" {
+        return true;
+    }
+    for unit in &["rem", "px", "pt", "em", "%"] {
+        if let Some(n) = t.strip_suffix(unit) {
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Strip a trailing CSS `!important` marker from `value`, repeatedly.
@@ -754,5 +994,222 @@ mod tests {
         );
         assert_eq!(strip_important(" !important "), ("".to_string(), true));
         assert_eq!(strip_important("12px"), ("12px".to_string(), false));
+    }
+
+    // ---- Phase 1.7c Slice A: shorthand expansion. ----
+
+    /// Find a longhand declaration by name in a flat list. Returns its
+    /// value as `&str`. Panics if the name is missing — every test that
+    /// uses this helper expects the longhand to have been emitted.
+    fn longhand<'a>(decls: &'a [Declaration], name: &str) -> &'a Declaration {
+        decls
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("missing {name} in {decls:#?}"))
+    }
+
+    #[test]
+    fn padding_one_value_expands_to_four_longhands() {
+        let rules = parse_stylesheet("p { padding: 12px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        for side in ["padding-top", "padding-right", "padding-bottom", "padding-left"] {
+            assert_eq!(longhand(d, side).value, "12px");
+            assert!(!longhand(d, side).important);
+        }
+        // The shorthand itself must NOT survive.
+        assert!(d.iter().all(|x| x.name != "padding"));
+    }
+
+    #[test]
+    fn padding_two_values_top_bottom_left_right() {
+        let rules = parse_stylesheet("p { padding: 10px 20px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        assert_eq!(longhand(d, "padding-top").value, "10px");
+        assert_eq!(longhand(d, "padding-bottom").value, "10px");
+        assert_eq!(longhand(d, "padding-right").value, "20px");
+        assert_eq!(longhand(d, "padding-left").value, "20px");
+    }
+
+    #[test]
+    fn padding_three_values_top_lr_bottom() {
+        let rules = parse_stylesheet("p { padding: 10px 20px 30px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        assert_eq!(longhand(d, "padding-top").value, "10px");
+        assert_eq!(longhand(d, "padding-right").value, "20px");
+        assert_eq!(longhand(d, "padding-left").value, "20px");
+        assert_eq!(longhand(d, "padding-bottom").value, "30px");
+    }
+
+    #[test]
+    fn padding_four_values_clockwise() {
+        let rules = parse_stylesheet("p { padding: 1px 2px 3px 4px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        assert_eq!(longhand(d, "padding-top").value, "1px");
+        assert_eq!(longhand(d, "padding-right").value, "2px");
+        assert_eq!(longhand(d, "padding-bottom").value, "3px");
+        assert_eq!(longhand(d, "padding-left").value, "4px");
+    }
+
+    #[test]
+    fn padding_extra_values_dropped() {
+        // 5 values is not a valid padding shorthand — the whole shorthand
+        // is dropped, and any siblings in the same block survive.
+        let rules = parse_stylesheet("p { padding: 1px 2px 3px 4px 5px; color: red; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        // Only `color` should remain; the padding shorthand expanded to nothing.
+        assert!(d.iter().all(|x| !x.name.starts_with("padding")));
+        assert_eq!(longhand(d, "color").value, "red");
+    }
+
+    #[test]
+    fn margin_shorthand_expands_like_padding() {
+        let rules = parse_stylesheet("p { margin: 10px 20px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        assert_eq!(longhand(d, "margin-top").value, "10px");
+        assert_eq!(longhand(d, "margin-bottom").value, "10px");
+        assert_eq!(longhand(d, "margin-right").value, "20px");
+        assert_eq!(longhand(d, "margin-left").value, "20px");
+    }
+
+    #[test]
+    fn margin_emits_all_four_sides_even_if_cascade_only_uses_two() {
+        // The cascade currently only consumes margin-top/margin-bottom.
+        // Phase 1.7c still emits all four longhands so future phases can
+        // pick up the horizontal sides without a parser change.
+        let rules = parse_stylesheet("p { margin: 7px; }");
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        let names: Vec<&str> = d.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"margin-top"));
+        assert!(names.contains(&"margin-right"));
+        assert!(names.contains(&"margin-bottom"));
+        assert!(names.contains(&"margin-left"));
+        for side in ["margin-top", "margin-right", "margin-bottom", "margin-left"] {
+            assert_eq!(longhand(d, side).value, "7px");
+        }
+    }
+
+    #[test]
+    fn border_shorthand_three_components_in_any_order() {
+        // Canonical order.
+        let rules = parse_stylesheet("p { border: 1px solid red; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "1px");
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert_eq!(longhand(d, "border-color").value, "red");
+
+        // Reversed order — components are recognised positionally-free.
+        let rules = parse_stylesheet("p { border: red solid 2px; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "2px");
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert_eq!(longhand(d, "border-color").value, "red");
+
+        // Mixed.
+        let rules = parse_stylesheet("p { border: solid 3px blue; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "3px");
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert_eq!(longhand(d, "border-color").value, "blue");
+    }
+
+    #[test]
+    fn border_shorthand_with_rgb_color_keeps_parens_intact() {
+        // `rgb(0, 0, 0)` must NOT be split on the spaces inside parens.
+        let rules = parse_stylesheet("p { border: rgb(0, 0, 0) solid 1px; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "1px");
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert_eq!(longhand(d, "border-color").value, "rgb(0, 0, 0)");
+    }
+
+    #[test]
+    fn border_shorthand_partial_expands_what_it_can() {
+        // Just `1px solid` — no colour token. Two longhands emitted.
+        let rules = parse_stylesheet("p { border: 1px solid; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "1px");
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert!(d.iter().all(|x| x.name != "border-color"));
+
+        // `solid red` — no length. Style + color emitted.
+        let rules = parse_stylesheet("p { border: solid red; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-style").value, "solid");
+        assert_eq!(longhand(d, "border-color").value, "red");
+        assert!(d.iter().all(|x| x.name != "border-width"));
+
+        // `2px red` — length + colorish, no style.
+        let rules = parse_stylesheet("p { border: 2px red; }");
+        let d = &rules[0].declarations;
+        assert_eq!(longhand(d, "border-width").value, "2px");
+        assert_eq!(longhand(d, "border-color").value, "red");
+        assert!(d.iter().all(|x| x.name != "border-style"));
+    }
+
+    #[test]
+    fn border_shorthand_unrecognised_is_dropped() {
+        // No length, no style keyword → drop the whole shorthand.
+        let rules = parse_stylesheet("p { border: foo bar; color: red; }");
+        let d = &rules[0].declarations;
+        assert!(d.iter().all(|x| !x.name.starts_with("border")));
+        assert_eq!(longhand(d, "color").value, "red");
+    }
+
+    #[test]
+    fn shorthand_preserves_important_flag() {
+        // The shorthand's `!important` propagates to every emitted longhand.
+        let rules = parse_stylesheet("p { padding: 5px !important; }");
+        let d = &rules[0].declarations;
+        assert_eq!(d.len(), 4);
+        for side in ["padding-top", "padding-right", "padding-bottom", "padding-left"] {
+            let lh = longhand(d, side);
+            assert_eq!(lh.value, "5px");
+            assert!(lh.important, "{side} should be !important");
+        }
+
+        // Same for border.
+        let rules = parse_stylesheet("p { border: 1px solid red !important; }");
+        let d = &rules[0].declarations;
+        for name in ["border-width", "border-style", "border-color"] {
+            assert!(longhand(d, name).important, "{name} should be !important");
+        }
+    }
+
+    #[test]
+    fn shorthand_inside_normal_block_round_trips_with_other_decls() {
+        // Shorthand expansion must not disturb adjacent longhand decls — they
+        // appear in source order with the shorthand's expansion spliced in.
+        let rules = parse_stylesheet(
+            "p { color: red; padding: 4px 8px; font-size: 12px; }",
+        );
+        assert_eq!(rules.len(), 1);
+        let d = &rules[0].declarations;
+        // 1 (color) + 4 (padding longhands) + 1 (font-size) = 6.
+        assert_eq!(d.len(), 6);
+        assert_eq!(d[0].name, "color");
+        assert_eq!(d[0].value, "red");
+        // Padding longhands occupy indices 1..=4.
+        assert_eq!(d[1].name, "padding-top");
+        assert_eq!(d[1].value, "4px");
+        assert_eq!(d[2].name, "padding-right");
+        assert_eq!(d[2].value, "8px");
+        assert_eq!(d[3].name, "padding-bottom");
+        assert_eq!(d[3].value, "4px");
+        assert_eq!(d[4].name, "padding-left");
+        assert_eq!(d[4].value, "8px");
+        assert_eq!(d[5].name, "font-size");
+        assert_eq!(d[5].value, "12px");
     }
 }

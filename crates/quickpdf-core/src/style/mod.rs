@@ -12,23 +12,34 @@ pub mod sheet;
 
 pub use cascade::{Color, TextAlign};
 
+/// Per-element inline `style="..."` declarations, keyed by the element's
+/// `NodeId`. Built once per `Document` (via `parse::Document::inline_styles`)
+/// and threaded through `resolve` for every paragraph render. An element
+/// missing from the map has no inline style.
+pub type InlineStyles<'a> =
+    std::collections::HashMap<ego_tree::NodeId, &'a [sheet::Declaration]>;
+
 /// Resolve the final `BlockStyle` for a paragraph element by combining
 /// UA defaults, the author cascade (with full specificity + `!important`),
-/// and inheritance from the element's ancestor chain.
+/// inline `style="..."` declarations, and inheritance from the element's
+/// ancestor chain.
 ///
 /// Cascade order, ascending (so the last-applied wins inside
 /// `cascade::apply_declarations`):
 ///
 /// 1. `important` flag — `false` before `true`. `!important` declarations
 ///    always win over non-important regardless of specificity.
-/// 2. Specificity — lexicographic `(ids, classes, tags)`.
+/// 2. Specificity — lexicographic `(inline, ids, classes, tags)`. Inline
+///    declarations carry [`matcher::Specificity::INLINE`], so they beat any
+///    selector-derived rule of equal `important` rank.
 /// 3. Source order — earlier rules lose ties to later rules.
 ///
 /// Inheritance walks root-to-element, folding `cascade::inherit` so the
-/// inherited properties (`font-size`, `text-align`) propagate down.
+/// inherited properties (`font-size`, `text-align`, `color`) propagate down.
 pub fn resolve(
     element: scraper::ElementRef<'_>,
     rules: &[sheet::Rule],
+    inline: &InlineStyles<'_>,
 ) -> BlockStyle {
     // Build the ancestor chain root-first so we can fold inheritance forward.
     let mut chain: Vec<scraper::ElementRef<'_>> = Vec::new();
@@ -41,7 +52,7 @@ pub fn resolve(
 
     let mut inherited: Option<BlockStyle> = None;
     for e in chain {
-        let local = resolve_local(e, rules);
+        let local = resolve_local(e, rules, inline);
         inherited = Some(match inherited.as_ref() {
             Some(parent) => cascade::inherit(parent, local),
             None => local,
@@ -51,11 +62,13 @@ pub fn resolve(
 }
 
 /// Resolve an element's *local* `BlockStyle` — UA defaults plus the
-/// author cascade for rules that match this element. Does NOT walk
-/// ancestors; that's `resolve`'s job.
+/// author cascade for rules that match this element, plus any inline
+/// `style="..."` declarations registered for this element's `NodeId`.
+/// Does NOT walk ancestors; that's `resolve`'s job.
 fn resolve_local(
     element: scraper::ElementRef<'_>,
     rules: &[sheet::Rule],
+    inline: &InlineStyles<'_>,
 ) -> BlockStyle {
     let tag = element.value().name();
     let ua = ua_style(tag);
@@ -79,6 +92,22 @@ fn resolve_local(
             }
         }
     }
+
+    // Inline `style="..."` declarations for this element. They carry the
+    // sentinel INLINE specificity (which beats any selector-derived
+    // specificity) and a sentinel source-order of `usize::MAX` (harmless,
+    // since INLINE never ties any selector spec).
+    if let Some(inline_decls) = inline.get(&element.id()) {
+        for d in *inline_decls {
+            decls.push((
+                d.important,
+                matcher::Specificity::INLINE,
+                usize::MAX,
+                d.clone(),
+            ));
+        }
+    }
+
     // Ascending: (false, low-spec, early) ... (true, high-spec, late).
     // `apply_declarations` walks the slice in order with last-wins semantics,
     // so the highest-priority declaration ends up applied last.
@@ -257,5 +286,168 @@ mod tests {
         for w in sizes.windows(2) {
             assert!(w[0] > w[1], "expected {} > {}", w[0], w[1]);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1.7c — inline `style="..."` cascade integration tests.
+    // -------------------------------------------------------------------
+
+    use scraper::{Html, Selector as ScraperSelector};
+    use sheet::{Declaration, Rule};
+
+    /// Build an empty `InlineStyles` map. Used by tests that exercise the
+    /// pre-1.7c cascade path (no inline overrides) but still need to satisfy
+    /// the new `resolve` signature.
+    fn empty_inline<'a>() -> InlineStyles<'a> {
+        std::collections::HashMap::new()
+    }
+
+    /// Helper: pick the first element matching `css` in a freshly-parsed
+    /// fragment.
+    fn first<'a>(html: &'a Html, css: &str) -> scraper::ElementRef<'a> {
+        let s = ScraperSelector::parse(css).expect("test css selector");
+        html.select(&s).next().expect("no element matched")
+    }
+
+    /// Helper: build a single declaration with `important = false`.
+    fn decl(name: &str, value: &str) -> Declaration {
+        Declaration {
+            name: name.to_string(),
+            value: value.to_string(),
+            important: false,
+        }
+    }
+
+    /// Helper: build a single declaration with `important = true`.
+    fn decl_important(name: &str, value: &str) -> Declaration {
+        Declaration {
+            name: name.to_string(),
+            value: value.to_string(),
+            important: true,
+        }
+    }
+
+    /// Helper: build a `Rule` with one selector text and a list of decls.
+    fn rule(selector: &str, decls: Vec<Declaration>, source_order: usize) -> Rule {
+        Rule {
+            selector_text: selector.to_string(),
+            declarations: decls,
+            source_order,
+        }
+    }
+
+    #[test]
+    fn inline_style_beats_id_selector() {
+        // Author rule sets font-size 12px on `#x`; inline style sets it
+        // to 24px. Inline must win because INLINE > any selector specificity
+        // at the same `important` rank.
+        let html = Html::parse_fragment(r#"<p id="x">hello</p>"#);
+        let p = first(&html, "p");
+
+        let rules = vec![rule("#x", vec![decl("font-size", "12px")], 0)];
+        let inline_decls = vec![decl("font-size", "24px")];
+        let mut inline: InlineStyles<'_> = std::collections::HashMap::new();
+        inline.insert(p.id(), inline_decls.as_slice());
+
+        let style = resolve(p, &rules, &inline);
+        assert!(
+            (style.font_size_em - 24.0 / 12.0).abs() < 1e-4,
+            "expected font-size 24px (=2.0em), got {}",
+            style.font_size_em
+        );
+    }
+
+    #[test]
+    fn inline_style_does_not_beat_important_id() {
+        // Selector rule with `!important` at 48px should beat a non-important
+        // inline `font-size: 24px`, because the !important rank trumps spec.
+        let html = Html::parse_fragment(r#"<p id="x">hello</p>"#);
+        let p = first(&html, "p");
+
+        let rules = vec![rule(
+            "#x",
+            vec![decl_important("font-size", "48px")],
+            0,
+        )];
+        let inline_decls = vec![decl("font-size", "24px")];
+        let mut inline: InlineStyles<'_> = std::collections::HashMap::new();
+        inline.insert(p.id(), inline_decls.as_slice());
+
+        let style = resolve(p, &rules, &inline);
+        assert!(
+            (style.font_size_em - 48.0 / 12.0).abs() < 1e-4,
+            "expected !important id-rule to win at 48px, got font_size_em {}",
+            style.font_size_em
+        );
+    }
+
+    #[test]
+    fn inline_important_beats_important_id() {
+        // Both sides are `!important`; inline still wins on specificity.
+        let html = Html::parse_fragment(r#"<p id="x">hello</p>"#);
+        let p = first(&html, "p");
+
+        let rules = vec![rule(
+            "#x",
+            vec![decl_important("color", "blue")],
+            0,
+        )];
+        let inline_decls = vec![decl_important("color", "red")];
+        let mut inline: InlineStyles<'_> = std::collections::HashMap::new();
+        inline.insert(p.id(), inline_decls.as_slice());
+
+        let style = resolve(p, &rules, &inline);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn inline_style_inherits_to_descendants() {
+        // Inline `color: red` on the <section> should inherit to the inner
+        // <p> via the standard parent-chain inheritance fold.
+        let html = Html::parse_fragment(r#"<section><p>hi</p></section>"#);
+        let section = first(&html, "section");
+        let p = first(&html, "p");
+
+        let inline_decls = vec![decl("color", "red")];
+        let mut inline: InlineStyles<'_> = std::collections::HashMap::new();
+        inline.insert(section.id(), inline_decls.as_slice());
+
+        let style = resolve(p, &[], &inline);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn no_inline_style_falls_back_to_rules() {
+        // Empty inline map: behaviour identical to the pre-1.7c cascade.
+        let html = Html::parse_fragment(r#"<p class="big">hi</p>"#);
+        let p = first(&html, "p");
+
+        let rules = vec![rule(".big", vec![decl("color", "red")], 0)];
+        let inline = empty_inline();
+
+        let style = resolve(p, &rules, &inline);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn inline_style_on_anonymous_block_parent_resolves() {
+        // Per parse.rs, an anonymous paragraph reuses its parent element's
+        // NodeId. Threading inline styles by NodeId means the parent's inline
+        // style applies to its anonymous-block paragraph too — verify by
+        // resolving from the parent element directly with that NodeId in
+        // the inline map.
+        let html = Html::parse_fragment(r#"<div>hello <p>world</p></div>"#);
+        let div = first(&html, "div");
+
+        let inline_decls = vec![decl("color", "red")];
+        let mut inline: InlineStyles<'_> = std::collections::HashMap::new();
+        inline.insert(div.id(), inline_decls.as_slice());
+
+        // The anonymous paragraph's `element_id` points at <div>'s NodeId,
+        // so resolving the <div> element with this inline map sees the
+        // declarations and applies them. (`Document::element_for` returns
+        // the parent element exactly, hence resolving `div` is equivalent.)
+        let style = resolve(div, &[], &inline);
+        assert_eq!(style.color, Color::rgb(255, 0, 0));
     }
 }
