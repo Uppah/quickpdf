@@ -103,17 +103,31 @@ struct PlacedBox {
     stroke: Option<(Color, f32)>,
 }
 
+/// One placed image: a krilla `Image` plus the target box rectangle to
+/// paint it into. The image was already validated by
+/// `krilla::image::Image::from_png` / `from_jpeg`, so emit-time decoding
+/// always succeeds. Width and height are in PDF points.
+#[derive(Debug, Clone)]
+struct PlacedImage {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    image: krilla::image::Image,
+}
+
 /// One page's worth of paint operations. Boxes are painted before lines
 /// so backgrounds sit behind their text content.
 #[derive(Debug, Clone, Default)]
 struct PagePlan {
     boxes: Vec<PlacedBox>,
+    images: Vec<PlacedImage>,
     lines: Vec<PlacedLine>,
 }
 
 impl PagePlan {
     fn is_empty(&self) -> bool {
-        self.boxes.is_empty() && self.lines.is_empty()
+        self.boxes.is_empty() && self.images.is_empty() && self.lines.is_empty()
     }
 }
 
