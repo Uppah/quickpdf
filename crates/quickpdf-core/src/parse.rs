@@ -60,22 +60,38 @@ impl Document {
     /// stack-direction block, with a vertical gap between blocks. Phase 1.6+
     /// will return styled tokens instead of plain strings.
     pub fn block_texts(&self) -> Vec<String> {
-        self.paragraphs().into_iter().map(|p| p.text).collect()
+        self.blocks()
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.text),
+                Block::Image(_) => None,
+            })
+            .collect()
+    }
+
+    /// Document content grouped into block-level units in document order.
+    /// Each entry is either a `TextBlock` (one paragraph of inline text)
+    /// or an `ImageBlock` (one `<img>` lifted into the stream). Anonymous
+    /// text blocks wrap orphan inline content inside mixed-content
+    /// containers; they reuse the parent's `element_id`.
+    pub fn blocks(&self) -> Vec<Block> {
+        let mut out: Vec<Block> = Vec::new();
+        let root = self.html.root_element();
+        collect_blocks(root, &mut out);
+        out
     }
 
     /// Visible text grouped into paragraphs, each tagged with the element
-    /// whose inline content it represents. The renderer uses the tag to look
-    /// up UA-default font size, weight, and margins (Phase 1.6+).
-    ///
-    /// "Paragraph" here = a block-level element whose children are all inline
-    /// (no nested blocks). Anonymous-block creation for orphan text inside a
-    /// container is deferred to Phase 1.6b — for now, raw text mixed between
-    /// block siblings is dropped.
+    /// whose inline content it represents. Retained for transition tests;
+    /// new callers should use `blocks()` and match on `Block::Text`.
     pub fn paragraphs(&self) -> Vec<Paragraph> {
-        let mut out: Vec<Paragraph> = Vec::new();
-        let root = self.html.root_element();
-        collect_paragraphs(root, &mut out);
-        out
+        self.blocks()
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t),
+                Block::Image(_) => None,
+            })
+            .collect()
     }
 
     /// Parse all `<style>` blocks in the document into a flat rule list.
@@ -86,11 +102,22 @@ impl Document {
         sheet::parse_stylesheet(&sheet::collect_style_blocks(self))
     }
 
-    /// Resolve a `Paragraph`'s element handle back to a live `ElementRef`.
+    /// Resolve a block's element handle back to a live `ElementRef`.
     /// Returns `None` if the handle is stale (which shouldn't happen — the
     /// `Document` owns the tree — but we treat it defensively).
+    ///
+    /// Takes `&Paragraph` (= `&TextBlock`) for backward compatibility with
+    /// lib.rs during the T5→T10 transition. T10 (integrator) updates this
+    /// to take `&Block` once all callers are migrated.
     pub fn element_for(&self, p: &Paragraph) -> Option<ElementRef<'_>> {
         let node = self.html.tree.get(p.element_id)?;
+        ElementRef::wrap(node)
+    }
+
+    /// New API: resolve any `Block`'s element handle back to a live
+    /// `ElementRef`. Replaces `element_for` once `lib.rs` is updated (T10).
+    pub fn element_for_block(&self, b: &Block) -> Option<ElementRef<'_>> {
+        let node = self.html.tree.get(b.element_id())?;
         ElementRef::wrap(node)
     }
 
@@ -106,17 +133,55 @@ impl Document {
     }
 }
 
+/// One block-level unit in document order. Either text content (the old
+/// `Paragraph`) or an image. The renderer matches on this enum to drive
+/// either the text-flow path or the image-paint path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    Text(TextBlock),
+    Image(ImageBlock),
+}
+
+impl Block {
+    /// The DOM element this block was emitted for. Anonymous text blocks
+    /// reuse the parent block container's element id.
+    pub fn element_id(&self) -> ego_tree::NodeId {
+        match self {
+            Block::Text(t) => t.element_id,
+            Block::Image(i) => i.element_id,
+        }
+    }
+}
+
 /// One paragraph's worth of inline text plus the block-level tag that
 /// produced it. The tag drives UA-default styles; the `element_id` lets
-/// the cascade match author selectors (Phase 1.6b) against the original DOM.
+/// the cascade match author selectors against the original DOM. Equivalent
+/// to the pre-2a `Paragraph` struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Paragraph {
+pub struct TextBlock {
     pub tag: String,
     pub text: String,
-    /// Stable handle into `Document::html.tree`. Use `Document::element_for`
-    /// to recover the live `ElementRef`.
-    pub element_id: NodeId,
+    pub element_id: ego_tree::NodeId,
 }
+
+/// A `<img>` lifted into the block stream. `src` is the raw attribute value
+/// (caller decodes via `crate::image::parse_data_url`). `width_attr` and
+/// `height_attr` capture the HTML `width` / `height` attributes if they
+/// parsed as plain numbers (CSS pixels — same as PDF points at our 1:1
+/// conversion baseline). `alt` is recorded for the integrator's fallback
+/// path when decoding fails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageBlock {
+    pub element_id: ego_tree::NodeId,
+    pub src: String,
+    pub width_attr: Option<f32>,
+    pub height_attr: Option<f32>,
+    pub alt: Option<String>,
+}
+
+// Backwards alias retained only for transition tests inside this file.
+// Removed in Slice B step 4.
+pub type Paragraph = TextBlock;
 
 /// Internal helper: drop the now-internal `Element` import warning when only
 /// some functions use it. Keep this unused-but-public access pattern explicit
@@ -160,6 +225,7 @@ fn is_block(tag: &str) -> bool {
             | "header"
             | "hgroup"
             | "hr"
+            | "img"
             | "li"
             | "main"
             | "nav"
@@ -192,15 +258,33 @@ fn collect_text(elem: ElementRef<'_>, out: &mut String) {
     }
 }
 
-/// Walk the tree and emit one `Paragraph` per "leaf" block-level element,
-/// where leaf = no block-level descendants. Recurses into containers, and
-/// (Phase 1.6c) wraps orphan inline content inside a mixed-content block in
-/// anonymous paragraphs that reuse the parent element's `NodeId`.
-fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
+/// Walk the tree and emit one `Block` per block-level element. For text
+/// containers this matches the pre-2a `collect_paragraphs` behavior — leaf
+/// blocks emit `Block::Text`, mixed-content containers emit anonymous
+/// `Block::Text` runs around their block children. For `<img>` we emit a
+/// `Block::Image` carrying `src`, optional `width`/`height` attrs, and
+/// optional `alt`.
+fn collect_blocks(elem: ElementRef<'_>, out: &mut Vec<Block>) {
     let name = elem.value().name();
     if is_skipped(name) {
         return;
     }
+
+    // <img> is an empty (void) block element. Don't recurse into children.
+    if name == "img" {
+        let attr_f32 = |key: &str| -> Option<f32> {
+            elem.value().attr(key).and_then(|v| v.trim().parse::<f32>().ok())
+        };
+        out.push(Block::Image(ImageBlock {
+            element_id: elem.id(),
+            src: elem.value().attr("src").unwrap_or("").to_string(),
+            width_attr: attr_f32("width"),
+            height_attr: attr_f32("height"),
+            alt: elem.value().attr("alt").map(|s| s.to_string()),
+        }));
+        return;
+    }
+
     let has_block_child = elem.children().any(|c| {
         if let Node::Element(e) = c.value() {
             !is_skipped(e.name()) && is_block(e.name())
@@ -209,21 +293,20 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
         }
     });
     if is_block(name) && has_block_child {
-        // Mixed-content block: walk children in order, accumulating inline
-        // text/element runs into an anonymous buffer. Block element children
-        // flush the buffer (only if non-empty after whitespace collapse) and
-        // then recurse normally. Skipped subtrees contribute nothing.
+        // Mixed-content block: walk children, accumulate inline text/element
+        // runs into an anonymous buffer. Block element children flush the
+        // buffer and recurse normally.
         let parent_id = elem.id();
         let mut buffer = String::new();
         let flush =
-            |buffer: &mut String, out: &mut Vec<Paragraph>| {
+            |buffer: &mut String, out: &mut Vec<Block>| {
                 let collapsed = collapse_whitespace(buffer.as_str());
                 if !collapsed.is_empty() {
-                    out.push(Paragraph {
+                    out.push(Block::Text(TextBlock {
                         tag: ANONYMOUS_TAG.to_string(),
                         text: collapsed,
                         element_id: parent_id,
-                    });
+                    }));
                 }
                 buffer.clear();
             };
@@ -233,16 +316,13 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
                 Node::Element(e) => {
                     let child_name = e.name();
                     if is_skipped(child_name) {
-                        // Skipped subtree contributes no text.
                         continue;
                     }
                     if let Some(child_elem) = ElementRef::wrap(child) {
                         if is_block(child_name) {
-                            // Flush pending inline run before recursing.
                             flush(&mut buffer, out);
-                            collect_paragraphs(child_elem, out);
+                            collect_blocks(child_elem, out);
                         } else {
-                            // Inline element — feed its text into the buffer.
                             collect_text(child_elem, &mut buffer);
                         }
                     }
@@ -250,29 +330,27 @@ fn collect_paragraphs(elem: ElementRef<'_>, out: &mut Vec<Paragraph>) {
                 _ => {}
             }
         }
-        // Trailing inline run, if any.
         flush(&mut buffer, out);
         return;
     }
     if !is_block(name) {
-        // Non-block root — recurse into element children, no anonymous wrap.
         for child in elem.children() {
             if let Some(child_elem) = ElementRef::wrap(child) {
-                collect_paragraphs(child_elem, out);
+                collect_blocks(child_elem, out);
             }
         }
         return;
     }
-    // Leaf block (is_block && !has_block_child): gather inline text content.
+    // Leaf block: gather inline text content.
     let mut text = String::new();
     collect_text(elem, &mut text);
     let collapsed = collapse_whitespace(&text);
     if !collapsed.is_empty() {
-        out.push(Paragraph {
+        out.push(Block::Text(TextBlock {
             tag: name.to_string(),
             text: collapsed,
             element_id: elem.id(),
-        });
+        }));
     }
 }
 
