@@ -177,6 +177,105 @@ fn parse_border_style(value: &str) -> Option<BorderStyle> {
     }
 }
 
+/// Phase 2b: parse a CSS `font-family` value into a normalised fallback
+/// list. Tokenises on top-level commas (respecting `"..."` and
+/// `'...'`), strips surrounding quotes, lowercases for symmetric
+/// lookup against `FontRegistry::by_family`, and drops generic family
+/// keywords (`serif`, `sans-serif`, `monospace`, …) for which Phase 2b
+/// has no concrete font. Returns `None` if the resulting list is
+/// empty (so `cascade::inherit` does not overwrite an inherited value).
+pub fn parse_font_family(value: &str) -> Option<Vec<String>> {
+    const GENERIC_KEYWORDS: &[&str] = &[
+        "serif",
+        "sans-serif",
+        "monospace",
+        "cursive",
+        "fantasy",
+        "system-ui",
+        "ui-serif",
+        "ui-sans-serif",
+        "ui-monospace",
+        "ui-rounded",
+        "emoji",
+        "math",
+        "fangsong",
+    ];
+
+    let mut out: Vec<String> = Vec::new();
+    for piece in split_top_level_commas(value) {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Strip a single matching pair of surrounding quotes.
+        let stripped = strip_outer_quotes(trimmed).trim();
+        if stripped.is_empty() {
+            continue;
+        }
+        let lower = stripped.to_ascii_lowercase();
+        if GENERIC_KEYWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        out.push(lower);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Strip a single pair of matching surrounding `"..."` or `'...'`
+/// quotes. No-op if the input isn't quoted.
+fn strip_outer_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Split a comma-separated CSS value at top-level commas, respecting
+/// quotes. Used by `parse_font_family`.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut pos = 0;
+    let mut in_quote: Option<u8> = None;
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        match in_quote {
+            Some(q) => {
+                if b == b'\\' && pos + 1 < bytes.len() {
+                    pos += 2;
+                    continue;
+                }
+                if b == q {
+                    in_quote = None;
+                }
+                pos += 1;
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    in_quote = Some(b);
+                    pos += 1;
+                } else if b == b',' {
+                    out.push(&s[start..pos]);
+                    pos += 1;
+                    start = pos;
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+    }
+    if start < bytes.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
 /// Parse a CSS length and return its em-equivalent, per the table in this
 /// file's module docs. Strict: any unit not listed yields `None`.
 fn parse_length_em(value: &str) -> Option<f32> {
@@ -935,6 +1034,67 @@ mod tests {
         assert_eq!(s.margin_top_em, 0.25);
         assert_eq!(s.margin_bottom_em, 0.5);
         assert_eq!(s.indent_em, 0.75);
+    }
+
+    // ---- Phase 2b Slice C: font-family parsing. ----
+
+    #[test]
+    fn font_family_single_unquoted_name() {
+        assert_eq!(
+            parse_font_family("Acme"),
+            Some(vec!["acme".to_string()])
+        );
+    }
+
+    #[test]
+    fn font_family_quoted_name_strips_quotes() {
+        assert_eq!(
+            parse_font_family("\"Acme Sans\""),
+            Some(vec!["acme sans".to_string()])
+        );
+        assert_eq!(
+            parse_font_family("'Acme Sans'"),
+            Some(vec!["acme sans".to_string()])
+        );
+    }
+
+    #[test]
+    fn font_family_comma_list_preserves_order() {
+        assert_eq!(
+            parse_font_family("\"Acme\", Helvetica, Arial"),
+            Some(vec![
+                "acme".to_string(),
+                "helvetica".to_string(),
+                "arial".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn font_family_drops_generic_keywords() {
+        // sans-serif / serif / monospace / etc. are dropped (we have no
+        // concrete font for any of them in 2b).
+        assert_eq!(
+            parse_font_family("Acme, sans-serif"),
+            Some(vec!["acme".to_string()])
+        );
+        // All-generic chain → None (empty list after drops).
+        assert_eq!(parse_font_family("sans-serif, serif"), None);
+    }
+
+    #[test]
+    fn font_family_empty_value_returns_none() {
+        assert_eq!(parse_font_family(""), None);
+        assert_eq!(parse_font_family("  "), None);
+        assert_eq!(parse_font_family(","), None);
+    }
+
+    #[test]
+    fn font_family_lowercases_for_lookup() {
+        assert_eq!(
+            parse_font_family("ACME, Helvetica"),
+            Some(vec!["acme".to_string(), "helvetica".to_string()])
+        );
     }
 
     // ---- Phase 2a Slice C: width / height longhands. ----
