@@ -886,4 +886,25 @@ mod tests {
             other => panic!("expected ImageBlock, got {other:?}"),
         }
     }
+
+    #[test]
+    fn img_without_src_stores_empty_string() {
+        // Bare <img> with no `src` attribute: the parser stores "" rather
+        // than dropping the block. The integrator (T12) calls
+        // `parse_data_url("")` which returns `None` and triggers the alt
+        // fallback path — but only because the block reaches it carrying
+        // an empty src. Capture this contract explicitly.
+        let d = Document::parse(r#"<img>"#);
+        let bs = d.blocks();
+        assert_eq!(bs.len(), 1, "expected exactly one block, got {bs:?}");
+        match &bs[0] {
+            Block::Image(img) => {
+                assert_eq!(img.src, "");
+                assert!(img.width_attr.is_none());
+                assert!(img.height_attr.is_none());
+                assert!(img.alt.is_none());
+            }
+            other => panic!("expected ImageBlock, got {other:?}"),
+        }
+    }
 }
