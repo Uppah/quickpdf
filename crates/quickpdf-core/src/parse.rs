@@ -803,4 +803,87 @@ mod tests {
         assert_eq!(inline[0].1[0].name, "color");
         assert_eq!(inline[0].1[0].value, "red");
     }
+
+    // ---- Phase 2a Slice B: <img> as a block-level element. ----
+
+    #[test]
+    fn img_with_src_emits_one_image_block() {
+        let d = Document::parse(r#"<img src="data:image/png;base64,xyz">"#);
+        let bs = d.blocks();
+        assert_eq!(bs.len(), 1, "expected exactly one block, got {bs:?}");
+        match &bs[0] {
+            Block::Image(img) => {
+                assert_eq!(img.src, "data:image/png;base64,xyz");
+                assert!(img.width_attr.is_none());
+                assert!(img.height_attr.is_none());
+                assert!(img.alt.is_none());
+            }
+            other => panic!("expected ImageBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn img_captures_width_height_alt_attrs() {
+        let d = Document::parse(
+            r#"<img src="data:image/png;base64,x" width="120" height="80" alt="logo">"#,
+        );
+        let bs = d.blocks();
+        assert_eq!(bs.len(), 1);
+        match &bs[0] {
+            Block::Image(img) => {
+                assert_eq!(img.width_attr, Some(120.0));
+                assert_eq!(img.height_attr, Some(80.0));
+                assert_eq!(img.alt.as_deref(), Some("logo"));
+            }
+            other => panic!("expected ImageBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn img_inside_p_splits_paragraph_into_three_blocks() {
+        // Phase 2a always treats <img> as block-level. The 1.6c
+        // anonymous-block walker splits the surrounding inline text.
+        let d = Document::parse(
+            r#"<p>before <img src="data:image/png;base64,x"> after</p>"#,
+        );
+        let bs = d.blocks();
+        assert_eq!(bs.len(), 3, "expected 3 blocks, got {bs:?}");
+        match &bs[0] {
+            Block::Text(t) => {
+                assert_eq!(t.tag, ANONYMOUS_TAG);
+                assert_eq!(t.text, "before");
+            }
+            other => panic!("[0] should be anon text, got {other:?}"),
+        }
+        match &bs[1] {
+            Block::Image(img) => assert_eq!(img.src, "data:image/png;base64,x"),
+            other => panic!("[1] should be image, got {other:?}"),
+        }
+        match &bs[2] {
+            Block::Text(t) => {
+                assert_eq!(t.tag, ANONYMOUS_TAG);
+                assert_eq!(t.text, "after");
+            }
+            other => panic!("[2] should be anon text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn img_with_unparseable_size_attrs_falls_through_to_none() {
+        // `width="auto"` and `height="50%"` aren't plain f32, so the
+        // parser stores `None` and the integrator falls back to CSS or
+        // intrinsic sizing.
+        let d = Document::parse(
+            r#"<img src="data:image/png;base64,x" width="auto" height="50%">"#,
+        );
+        let bs = d.blocks();
+        assert_eq!(bs.len(), 1);
+        match &bs[0] {
+            Block::Image(img) => {
+                assert!(img.width_attr.is_none());
+                assert!(img.height_attr.is_none());
+            }
+            other => panic!("expected ImageBlock, got {other:?}"),
+        }
+    }
 }
