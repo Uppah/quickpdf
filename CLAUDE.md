@@ -32,13 +32,13 @@ something genuinely new, not another browser wrapper.
 | 1.7b  |   ✓    | `background-color`, `padding-*`, `border-*` via PlacedBox paint pass                 |
 | 1.7c  |   ✓    | `rem` unit, padding/margin/border shorthand, inline `style="..."` (4-tuple specificity) |
 |  2a   |   ✓    | Block-level `<img>` (PNG/JPEG via `data:` URL, HTML+CSS sizing, alt fallback)         |
-|  2b   |   →    | **NEXT.** Web fonts via `@font-face`                                                  |
-|  2c   |        | Tables (`<table>`/`<tr>`/`<td>`) — proper 2D layout                                    |
+|  2b   |   ✓    | Web fonts via `@font-face` (data:font/ttf\|otf URLs, permissive MIME + magic sniff)    |
+|  2c   |   →    | **NEXT.** Tables (`<table>`/`<tr>`/`<td>`) — proper 2D layout                          |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf` v0.1                        |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel                                   |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS                              |
 
-**Test posture today:** 189 Rust unit tests + 50 Python integration tests, all
+**Test posture today:** 233 Rust unit tests + 55 Python integration tests, all
 green in ~0.5 s combined.
 
 ## Build + test (always)
@@ -134,32 +134,46 @@ quickpdf/
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next
   to it and **must be preserved on any redistribution**.
 
-## Next session: Phase 2b — web fonts
+## Next session: Phase 2c — tables
 
-Phase 2a is complete. Phase 2b adds `@font-face` parsing in
-`sheet.rs::skip_at_rule` (currently dropped) and threads custom
-`Font` instances through `font.rs` and the planner. Slice plan to
-follow once brainstorming nails down scope (system-font fallback?
-Embed only Latin subset of `@font-face` payloads? Rejection on
-unsupported font formats?).
+Phase 2b is complete. Phase 2c adds `<table>`/`<tr>`/`<td>` block
+support. The block stream already accepts new variants cleanly via
+`parse::Block` (the pattern Phase 2a established), and
+`BlockStyle::width_em`/`height_em` already exist for column-width
+expression. New work:
 
-Cross-cutting Phase 2a artefacts to keep in mind for future phases:
+- A new `parse::Block::Table(...)` variant carrying row/cell structure.
+- A 2D layout pass that resolves column widths (auto, fixed, percentage),
+  flows cell content as nested blocks, and paginates rows.
+- Cascade for `border-collapse`, `border-spacing`, `vertical-align`.
 
-- `parse::Block` enum is the canonical block-level stream now. New
-  block-level features (videos, embeds, eventually tables) add
-  variants to `Block` rather than back-doors through `Paragraph`.
-- `style::BlockStyle::width_em` / `height_em` are present but only
-  consumed by `<img>` today. Tables (Phase 2c) and any future
-  fixed-width container will read the same fields — no cascade
-  changes needed.
-- Image data URLs are decoded via krilla's own decoders
-  (`Image::from_png`, `Image::from_jpeg`); no `image` crate
-  dependency. WebP/GIF would only need `from_webp`/`from_gif`
-  arms in `place_image_block` and corresponding MIME entries in
-  `image::parse_data_url`.
-- Percentage (`%`) widths/heights on `<img>` are explicitly dropped
-  by the cascade. A future `enum Length { Em, Percent }` upgrade
-  unblocks them globally.
+Cross-cutting Phase 2b artefacts to keep in mind for future phases:
+
+- `style::sheet::Stylesheet { rules, font_faces }` is the canonical
+  stylesheet output. The legacy `parse_stylesheet -> Vec<Rule>` and
+  `Document::user_stylesheet` are kept as back-compat shims; new code
+  should use `Document::stylesheet()` and `parse_stylesheet_full`.
+- `font::FontRegistry` is built once per `html_to_pdf` call. Phase 3's
+  bulk-render path will likely hoist registry construction out of the
+  per-call loop and share it across multiple HTMLs in a batch.
+- `BlockStyle.font_family: Option<Vec<String>>` is inherited per CSS
+  spec via `cascade::inherit`'s `child.or_else(|| parent.clone())` arm
+  (different shape from the `f32`/`Color` sentinel-compare arms — for
+  `Option`, `None` is the natural sentinel).
+- Generic family keywords (`sans-serif`, `serif`, `monospace`, …) are
+  dropped at cascade time. A future phase that maps them to concrete
+  fonts (via system probing or bundled additional families) would
+  re-introduce them as registry entries rather than touching the cascade.
+- WOFF/WOFF2 srcs are silently skipped. Adding WOFF support would mean
+  an extra arm in `font::decode_data_url` plus a zlib decode of the
+  WOFF wrapper (krilla owns the resulting sfnt).
+- `style::sheet::split_top_level_semicolons` now tracks paren depth so
+  `;` inside `url(data:font/ttf;base64,...)` doesn't split the
+  declaration. Latent pre-2b bug, harmless until @font-face was real
+  input — fixed in commit `0be29c3`.
+- `BlockStyle` and `BlockStyleBuilder` lost their `Copy` derives because
+  `font_family: Option<Vec<String>>` isn't `Copy`. Anywhere that needs
+  duplication now uses `.clone()`.
 
 ## Phase 1.6 parallel-sprint pattern (proven, repeat for 1.7)
 
