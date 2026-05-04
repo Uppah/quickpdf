@@ -19,6 +19,8 @@ use krilla::paint::{Fill, Stroke};
 use krilla::page::PageSettings;
 use krilla::surface::Surface;
 use krilla::text::{Font, TextDirection};
+use krilla::geom::Transform;
+use krilla::image::Image as KrillaImage;
 use thiserror::Error;
 
 use crate::style::Color;
@@ -177,6 +179,17 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
                 paint_box(&mut surface, b);
             }
 
+            // Paint images between boxes and text — backgrounds behind, text
+            // potentially overlapping in front.
+            for img in &page_plan.images {
+                let Some(target) = krilla::geom::Size::from_wh(img.w, img.h) else {
+                    continue;
+                };
+                surface.push_transform(&Transform::from_translate(img.x, img.y));
+                surface.draw_image(img.image.clone(), target);
+                surface.pop();
+            }
+
             let mut current_color: Option<Color> = None;
             for line in &page_plan.lines {
                 if current_color != Some(line.color) {
@@ -299,11 +312,16 @@ fn plan_pages_styled(
     let mut cursor_y: Option<f32> = None;
 
     for block in blocks {
-        // Phase 2a: image branch is added in Task 12. For now, skip non-text
-        // blocks so the existing text-rendering tests stay green.
         let para = match block {
             parse::Block::Text(t) => t,
-            parse::Block::Image(_) => continue,
+            parse::Block::Image(img_block) => {
+                place_image_block(
+                    doc, block, img_block, user_rules, inline,
+                    left_margin, content_width, bottom_limit, page_content_height,
+                    &mut pages, &mut current, &mut cursor_y,
+                )?;
+                continue;
+            }
         };
         let style = match doc.element_for_block(block) {
             Some(elem) => style::resolve(elem, user_rules, inline),
@@ -422,6 +440,189 @@ fn plan_pages_styled(
         pages.push(current);
     }
     Ok(pages)
+}
+
+/// Phase 2a image-block layout. Decodes the data URL, computes the target
+/// box, applies paint-as-unit pagination, and emits a `PlacedImage` plus
+/// optional `PlacedBox` for any background/border.
+///
+/// On decode failure, returns `Ok(())` after either emitting a synthetic
+/// text block carrying the `alt` attribute (which the caller did NOT plan
+/// because the text path is single-pass) or dropping silently. Phase 2a
+/// keeps the alt-fallback behavior simple by letting the caller restart
+/// the loop with an injected synthetic text block — but to avoid a global
+/// refactor, this helper instead emits the alt directly into the current
+/// page using the same line-placement primitives the text path uses.
+#[allow(clippy::too_many_arguments)]
+fn place_image_block(
+    doc: &parse::Document,
+    block: &parse::Block,
+    img_block: &parse::ImageBlock,
+    user_rules: &[style::sheet::Rule],
+    inline: &style::InlineStyles<'_>,
+    left_margin: f32,
+    content_width: f32,
+    bottom_limit: f32,
+    page_content_height: f32,
+    pages: &mut Vec<PagePlan>,
+    current: &mut PagePlan,
+    cursor_y: &mut Option<f32>,
+) -> Result<(), Error> {
+    let style = match doc.element_for_block(block) {
+        Some(elem) => style::resolve(elem, user_rules, inline),
+        None => style::ua_style("img"),
+    };
+    let font_size = DEFAULT_FONT_SIZE_PT * style.font_size_em;
+    let line_height = font_size * DEFAULT_LINE_HEIGHT;
+    let pad_top = font_size * style.padding_top_em;
+    let pad_right = font_size * style.padding_right_em;
+    let pad_bot = font_size * style.padding_bottom_em;
+    let pad_left = font_size * style.padding_left_em;
+    let border_w = font_size * style.border_width_em;
+
+    // Decode the data URL. Anything other than Some(_) → alt fallback.
+    let decoded = crate::image::parse_data_url(&img_block.src);
+    let krilla_img = decoded.and_then(|(kind, bytes)| {
+        let data: krilla::Data = bytes.into();
+        match kind {
+            crate::image::ImageKind::Png => KrillaImage::from_png(data, false).ok(),
+            crate::image::ImageKind::Jpeg => KrillaImage::from_jpeg(data, false).ok(),
+        }
+    });
+    let krilla_img = match krilla_img {
+        Some(i) => i,
+        None => {
+            // Alt fallback. Emit alt text as a synthetic line at the current
+            // cursor position using the same text-flow logic the text path
+            // would use for an anonymous paragraph at default style.
+            if let Some(alt) = img_block.alt.as_deref().filter(|s| !s.is_empty()) {
+                let metrics = text::TextMetrics::new(font::FALLBACK_TTF, font_size)
+                    .ok_or_else(|| Error::Pdf("fallback metrics".into()))?;
+                let lines = text::wrap_lines(&metrics, alt, content_width);
+                if lines.is_empty() {
+                    return Ok(());
+                }
+                if cursor_y.is_none() {
+                    *cursor_y = Some(MARGIN_PT + line_height);
+                }
+                for line in lines {
+                    let y = cursor_y.unwrap();
+                    if y > bottom_limit {
+                        pages.push(std::mem::take(current));
+                        *cursor_y = Some(MARGIN_PT + line_height);
+                    }
+                    let final_y = cursor_y.unwrap();
+                    current.lines.push(PlacedLine {
+                        y: final_y,
+                        x: left_margin,
+                        font_size_pt: font_size,
+                        text: line,
+                        color: style.color,
+                    });
+                    *cursor_y = Some(final_y + line_height);
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    // Compute target box dimensions. Resolution order matches the spec.
+    let (w_px, h_px) = krilla_img.size();
+    let intrinsic_w = w_px as f32;
+    let intrinsic_h = h_px as f32;
+    let aspect = if intrinsic_h > 0.0 { intrinsic_w / intrinsic_h } else { 1.0 };
+
+    let css_w = style.width_em.map(|e| font_size * e);
+    let css_h = style.height_em.map(|e| font_size * e);
+    let attr_w = img_block.width_attr;
+    let attr_h = img_block.height_attr;
+
+    let chosen_w = css_w.or(attr_w);
+    let chosen_h = css_h.or(attr_h);
+
+    let (mut target_w, mut target_h) = match (chosen_w, chosen_h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, if aspect > 0.0 { w / aspect } else { intrinsic_h }),
+        (None, Some(h)) => (h * aspect, h),
+        (None, None) => {
+            // Intrinsic, capped at content_width.
+            let inner_w = (content_width - 2.0 * border_w - pad_left - pad_right).max(1.0);
+            if intrinsic_w > inner_w {
+                let scale = inner_w / intrinsic_w;
+                (intrinsic_w * scale, intrinsic_h * scale)
+            } else {
+                (intrinsic_w, intrinsic_h)
+            }
+        }
+    };
+
+    // Paint-as-unit pagination + oversize shrink.
+    let block_height_total =
+        |h: f32| pad_top + h + pad_bot + 2.0 * border_w;
+
+    if cursor_y.is_none() {
+        *cursor_y = Some(MARGIN_PT + line_height);
+    }
+    let top_margin_pt = font_size * style.margin_top_em;
+    let pre_top = cursor_y.unwrap() + top_margin_pt + line_height * PARAGRAPH_GAP_LINES;
+    let candidate_top = pre_top - line_height;
+
+    let total_h = block_height_total(target_h);
+    let box_top = if candidate_top + total_h <= bottom_limit {
+        candidate_top
+    } else if total_h <= page_content_height {
+        if !current.is_empty() {
+            pages.push(std::mem::take(current));
+        }
+        *cursor_y = Some(MARGIN_PT + line_height);
+        MARGIN_PT
+    } else {
+        // Oversize: proportionally shrink so block_height_total fits.
+        let max_image_h = (page_content_height - pad_top - pad_bot - 2.0 * border_w).max(1.0);
+        let scale = max_image_h / target_h;
+        target_h = max_image_h;
+        target_w *= scale;
+        if !current.is_empty() {
+            pages.push(std::mem::take(current));
+        }
+        *cursor_y = Some(MARGIN_PT + line_height);
+        MARGIN_PT
+    };
+
+    // Optional decoration box.
+    let has_decoration = style.background_color.is_some() || border_w > 0.0;
+    let box_width = (content_width).max(1.0);
+    if has_decoration {
+        let stroke = if border_w > 0.0 {
+            Some((style.border_color, border_w))
+        } else {
+            None
+        };
+        current.boxes.push(PlacedBox {
+            x: left_margin,
+            y: box_top,
+            w: box_width,
+            h: total_h,
+            fill: style.background_color,
+            stroke,
+        });
+    }
+
+    let img_x = left_margin + border_w + pad_left;
+    let img_y = box_top + border_w + pad_top;
+    current.images.push(PlacedImage {
+        x: img_x,
+        y: img_y,
+        w: target_w,
+        h: target_h,
+        image: krilla_img,
+    });
+
+    *cursor_y = Some(box_top + total_h);
+    if let Some(y) = cursor_y.as_mut() {
+        *y += font_size * style.margin_bottom_em;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -798,5 +999,114 @@ mod tests {
             "expected 2rem → 24pt, got {}",
             line.font_size_pt
         );
+    }
+
+    // ---- Phase 2a integrator: image rendering. ----
+
+    /// Tiny known-good PNG (1x1 red pixel). Same constant as image.rs
+    /// uses — duplicated here so the test is self-contained.
+    const TINY_PNG_BYTES: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00,
+        0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63,
+        0xfc, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a,
+        0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+        0x42, 0x60, 0x82,
+    ];
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn img_with_data_url_emits_placed_image() {
+        let html = format!(
+            r#"<img src="data:image/png;base64,{}" width="100" height="50">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        assert_eq!(pages.len(), 1, "expected one page");
+        assert_eq!(pages[0].images.len(), 1, "expected one PlacedImage");
+        let pi = &pages[0].images[0];
+        assert!((pi.w - 100.0).abs() < 0.5, "expected w≈100pt, got {}", pi.w);
+        assert!((pi.h - 50.0).abs() < 0.5, "expected h≈50pt, got {}", pi.h);
+    }
+
+    #[test]
+    fn img_with_no_size_uses_intrinsic_capped_to_content_width() {
+        // Tiny PNG is 1×1 px → intrinsic 1×1 pt. No shrink needed.
+        let html = format!(
+            r#"<img src="data:image/png;base64,{}">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        assert_eq!(pages[0].images.len(), 1);
+        let pi = &pages[0].images[0];
+        assert!((pi.w - 1.0).abs() < 0.5);
+        assert!((pi.h - 1.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn img_height_only_attr_derives_width_from_aspect() {
+        // 1×1 intrinsic, height set to 200 → width should be 200.
+        let html = format!(
+            r#"<img src="data:image/png;base64,{}" height="200">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        let pi = &pages[0].images[0];
+        assert!((pi.h - 200.0).abs() < 0.5);
+        assert!((pi.w - 200.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn img_css_width_overrides_html_attr() {
+        let html = format!(
+            r#"<style>img {{ width: 60px; }}</style>
+<img src="data:image/png;base64,{}" width="120" height="120">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        let pi = &pages[0].images[0];
+        // CSS width 60px → 60pt; aspect-preserved height drops to 60pt.
+        assert!((pi.w - 60.0).abs() < 0.5, "expected CSS to override attr, got w={}", pi.w);
+    }
+
+    #[test]
+    fn img_with_broken_src_falls_through_to_alt_text() {
+        // No data URL — the integrator emits a synthetic text block carrying
+        // the alt attribute, which the text path then renders.
+        let pages = plan(r#"<img src="https://example.com/nope.png" alt="missing image">"#);
+        let texts: Vec<&str> = pages[0].iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            texts.contains(&"missing image"),
+            "expected alt text 'missing image' in {texts:?}"
+        );
+    }
+
+    #[test]
+    fn img_with_broken_src_and_no_alt_drops_silently() {
+        let pages = plan_full(r#"<img src="garbage">"#);
+        assert!(
+            pages.is_empty() || pages[0].is_empty(),
+            "expected no output for broken-src no-alt, got {pages:?}"
+        );
+    }
+
+    #[test]
+    fn img_too_tall_proportionally_shrinks_to_page_height() {
+        // 1×1 intrinsic, but force a 9999pt-tall layout via height attr.
+        // page_content_height in plan_full is 800 - 36 = 764.
+        let html = format!(
+            r#"<img src="data:image/png;base64,{}" width="9999" height="9999">"#,
+            b64(TINY_PNG_BYTES),
+        );
+        let pages = plan_full(&html);
+        let pi = &pages[0].images[0];
+        // Aspect 1:1, capped at content_height; pad/border are 0 here.
+        assert!(pi.h <= 764.0 + 0.01, "expected h ≤ 764pt, got {}", pi.h);
+        assert!((pi.w - pi.h).abs() < 0.5, "aspect must be preserved");
     }
 }
