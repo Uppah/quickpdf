@@ -9,9 +9,9 @@ use ego_tree::NodeId;
 
 use crate::style::sheet::{self, Declaration, Rule};
 
-/// Sentinel `Paragraph::tag` value for an anonymous block created by
-/// `collect_paragraphs` to wrap orphan inline content inside a container
-/// element that also has block children. Anonymous paragraphs reuse the
+/// Sentinel `TextBlock::tag` value for an anonymous block created by
+/// `collect_blocks` to wrap orphan inline content inside a container
+/// element that also has block children. Anonymous text blocks reuse the
 /// **parent** element's `element_id`.
 pub const ANONYMOUS_TAG: &str = "anonymous";
 
@@ -109,6 +109,7 @@ impl Document {
     /// Takes `&Paragraph` (= `&TextBlock`) for backward compatibility with
     /// lib.rs during the T5→T10 transition. T10 (integrator) updates this
     /// to take `&Block` once all callers are migrated.
+    #[deprecated(note = "use element_for_block(&Block); this transition shim is removed when lib.rs migrates in Plan T10")]
     pub fn element_for(&self, p: &Paragraph) -> Option<ElementRef<'_>> {
         let node = self.html.tree.get(p.element_id)?;
         ElementRef::wrap(node)
@@ -133,6 +134,10 @@ impl Document {
     }
 }
 
+// `f32` fields in `ImageBlock` (width_attr, height_attr) prevent `Eq` —
+// HTML allows fractional pixel values like `<img width="120.5">`, so we
+// keep the float type to preserve precision. Block and ImageBlock therefore
+// derive only `PartialEq`.
 /// One block-level unit in document order. Either text content (the old
 /// `Paragraph`) or an image. The renderer matches on this enum to drive
 /// either the text-flow path or the image-paint path.
@@ -521,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn anonymous_uses_parent_element_id() {
         let d = Document::parse("<div>before<p>middle</p>after</div>");
         let ps = d.paragraphs();
@@ -607,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn nested_anonymous_uses_correct_parent_id() {
         // Outer div has an anon "x" tied to the div, plus a <section>
         // that itself has mixed content → anon "y" tied to the section,
@@ -730,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn inline_styles_node_id_resolves_via_element_for() {
         // Build a synthetic Paragraph with the inline-style NodeId and
         // confirm element_for round-trips back to the right element.
