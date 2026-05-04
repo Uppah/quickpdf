@@ -6,6 +6,8 @@ expands this into actual content checks.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import quickpdf
 
 
@@ -678,3 +680,90 @@ def test_pdf_image_with_decoration_emits_fill_and_image():
     streams = _pdf_content_streams(pdf)
     assert "1 1 0 rg" in streams, "expected yellow background fill"
     assert b"/Subtype /Image" in pdf
+
+
+# --- Phase 2b: @font-face web fonts ----------------------------------------
+
+
+def _inter_data_url() -> str:
+    """Return a `data:font/ttf;base64,...` URL using the bundled Inter
+    bytes. quickpdf doesn't expose the font bytes through its Python
+    API, so this helper reads the source-tree fixture directly."""
+    import base64
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "crates" / "quickpdf-core" / "assets" / "fonts" / "Inter-Regular.ttf"
+    )
+    raw = src.read_bytes()
+    return "data:font/ttf;base64," + base64.b64encode(raw).decode("ascii")
+
+
+def test_pdf_font_face_renders_paragraph():
+    # Smoke: declaring an @font-face block and using it on a <p> must
+    # produce a valid PDF without raising.
+    url = _inter_data_url()
+    html = (
+        f'<style>@font-face {{ font-family: "Acme"; src: url({url}); }}</style>'
+        '<p style="font-family: Acme">hello</p>'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf)
+    assert "hello" in text
+
+
+def test_pdf_font_face_with_no_match_falls_back_silently():
+    # font-family on a paragraph but no matching @font-face → silent
+    # fallback to Inter; rendering still produces a valid PDF.
+    html = '<p style="font-family: NotRegistered">hello</p>'
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf)
+    assert "hello" in text
+
+
+def test_pdf_font_face_with_broken_payload_falls_back():
+    # Garbage base64 inside an otherwise well-formed @font-face block.
+    # The face is silently dropped; the paragraph still renders.
+    html = (
+        '<style>@font-face { font-family: "Acme"; '
+        'src: url(data:font/ttf;base64,!!!notbase64!!!); }</style>'
+        '<p style="font-family: Acme">resilient</p>'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf)
+    assert "resilient" in text
+
+
+def test_pdf_font_face_with_woff2_src_drops_face():
+    # data:font/woff2 is not in the accept list. The face is dropped;
+    # font-family: Acme cascades to Inter; PDF renders fine.
+    html = (
+        '<style>@font-face { font-family: "Acme"; '
+        'src: url(data:font/woff2;base64,d09GMg==); }</style>'
+        '<p style="font-family: Acme">woff2 dropped</p>'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf)
+    assert "woff2 dropped" in text
+
+
+def test_pdf_multi_paragraph_mixed_families_renders():
+    # Two paragraphs, each using a different @font-face. The PDF must
+    # render both without crashing on the font swap mid-page.
+    url = _inter_data_url()
+    html = (
+        '<style>'
+        f'@font-face {{ font-family: "Alpha"; src: url({url}); }} '
+        f'@font-face {{ font-family: "Beta"; src: url({url}); }}'
+        '</style>'
+        '<p style="font-family: Alpha">first</p>'
+        '<p style="font-family: Beta">second</p>'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf)
+    assert "first" in text
+    assert "second" in text
