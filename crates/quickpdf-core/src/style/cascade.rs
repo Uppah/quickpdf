@@ -350,7 +350,7 @@ fn parse_rgb_component(raw: &str) -> Option<u8> {
 /// - `bold` (CSS spec inherits `font-weight`, but we have no bold font yet;
 ///   revisit Phase 4)
 /// - `margin_top_em`, `margin_bottom_em`, `indent_em`
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BlockStyleBuilder {
     pub font_size_em: Option<f32>,
     pub bold: Option<bool>,
@@ -368,6 +368,7 @@ pub struct BlockStyleBuilder {
     pub border_color: Option<Color>,
     pub width_em: Option<Option<f32>>,
     pub height_em: Option<Option<f32>>,
+    pub font_family: Option<Option<Vec<String>>>,
 }
 
 impl BlockStyleBuilder {
@@ -393,6 +394,7 @@ impl BlockStyleBuilder {
             border_color: Some(style.border_color),
             width_em: Some(style.width_em),
             height_em: Some(style.height_em),
+            font_family: Some(style.font_family),
         }
     }
 
@@ -422,6 +424,7 @@ impl BlockStyleBuilder {
             border_color: self.border_color.unwrap_or(def.border_color),
             width_em: self.width_em.unwrap_or(def.width_em),
             height_em: self.height_em.unwrap_or(def.height_em),
+            font_family: self.font_family.unwrap_or(def.font_family),
         }
     }
 }
@@ -463,6 +466,14 @@ pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
         // Width/height are not inherited per CSS — pass child's through.
         width_em: child.width_em,
         height_em: child.height_em,
+        // font-family is inherited per CSS spec. For Option, the rule is
+        // "child value wins; fall back to parent if child has none."
+        // This differs from f32/Color arms above (which sentinel-compare
+        // against DEFAULT) — for an Option, None is the natural sentinel.
+        font_family: child
+            .font_family
+            .clone()
+            .or_else(|| parent.font_family.clone()),
     }
 }
 
@@ -686,7 +697,7 @@ mod tests {
             color: Color::rgb(10, 20, 30),
             ..BlockStyle::DEFAULT
         };
-        let b = BlockStyleBuilder::from_block(original);
+        let b = BlockStyleBuilder::from_block(original.clone());
         // No parent — every field should round-trip from the builder.
         let s = b.build(None);
         assert_eq!(s.font_size_em, original.font_size_em);

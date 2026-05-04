@@ -120,7 +120,7 @@ fn resolve_local(
 /// Style hints attached to a paragraph by the user-agent stylesheet.
 /// Em-relative values are resolved against the document's base font size
 /// (Phase 1: 12pt; `:root { font-size: ... }` lands later).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlockStyle {
     /// Font size as a multiplier of the document's base size. 1.0 = body.
     pub font_size_em: f32,
@@ -161,6 +161,12 @@ pub struct BlockStyle {
     pub width_em: Option<f32>,
     /// Author-set height in em. Same semantics as `width_em`.
     pub height_em: Option<f32>,
+    /// Resolved `font-family` fallback list. `None` means "no
+    /// author-set value"; the planner uses bundled Inter at registry
+    /// index 0. Items are lowercased, quote-stripped, with generic
+    /// keywords (sans-serif/serif/monospace/...) dropped at parse
+    /// time. Inherited per CSS spec.
+    pub font_family: Option<Vec<String>>,
 }
 
 impl BlockStyle {
@@ -181,6 +187,7 @@ impl BlockStyle {
         border_color: Color::BLACK,
         width_em: None,
         height_em: None,
+        font_family: None,
     };
 }
 
@@ -436,6 +443,13 @@ mod tests {
 
         let style = resolve(p, &rules, &inline);
         assert_eq!(style.color, Color::rgb(255, 0, 0));
+    }
+
+    // ---- Phase 2b Slice C: font-family cascade. ----
+
+    #[test]
+    fn default_block_style_has_no_font_family() {
+        assert!(BlockStyle::DEFAULT.font_family.is_none());
     }
 
     #[test]
