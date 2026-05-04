@@ -115,4 +115,45 @@ mod tests {
         let (kind, _) = parse_data_url(&url).expect("jpg alias parses");
         assert_eq!(kind, ImageKind::Jpeg);
     }
+
+    #[test]
+    fn unsupported_mime_returns_none() {
+        let url = format!("data:image/gif;base64,{}", b64(TINY_PNG_BYTES));
+        assert!(parse_data_url(&url).is_none());
+        let url = format!("data:image/webp;base64,{}", b64(TINY_PNG_BYTES));
+        assert!(parse_data_url(&url).is_none());
+        let url = format!("data:text/plain;base64,{}", b64(b"hi"));
+        assert!(parse_data_url(&url).is_none());
+    }
+
+    #[test]
+    fn missing_base64_marker_returns_none() {
+        // Plain (URL-encoded) data URL — out of scope.
+        let url = format!("data:image/png,{}", b64(TINY_PNG_BYTES));
+        assert!(parse_data_url(&url).is_none());
+    }
+
+    #[test]
+    fn missing_comma_returns_none() {
+        // No payload separator at all.
+        assert!(parse_data_url("data:image/png;base64").is_none());
+    }
+
+    #[test]
+    fn malformed_base64_returns_none() {
+        // Trailing `!` is not a valid base64 character.
+        assert!(parse_data_url("data:image/png;base64,abcd!").is_none());
+        // Garbled mid-payload.
+        assert!(parse_data_url("data:image/png;base64,not===base64").is_none());
+    }
+
+    #[test]
+    fn empty_payload_returns_some_with_empty_bytes() {
+        // `data:image/png;base64,` is technically valid; krilla will reject
+        // empty bytes at emit time, which is the integrator's job to handle.
+        let (kind, bytes) = parse_data_url("data:image/png;base64,")
+            .expect("empty payload still parses to Some");
+        assert_eq!(kind, ImageKind::Png);
+        assert!(bytes.is_empty());
+    }
 }
