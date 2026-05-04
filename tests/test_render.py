@@ -588,3 +588,93 @@ def test_border_shorthand_emits_stroke():
     assert "\nS\n" in streams or " S\n" in streams, (
         "border shorthand must emit path-stroke `S`"
     )
+
+
+# --- Phase 2a: block-level images via data: URLs --------------------------
+
+# Tiny known-good PNG (1x1 red pixel, RGBA, all CRCs correct, 70 bytes).
+_TINY_PNG = bytes([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00,
+    0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63,
+    0xf8, 0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x56,
+    0xc7, 0x2f, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+])
+
+
+def _png_data_url() -> str:
+    import base64
+    return "data:image/png;base64," + base64.b64encode(_TINY_PNG).decode("ascii")
+
+
+def test_pdf_with_data_url_image_contains_image_xobject():
+    # An /XObject of /Subtype /Image must appear in the PDF when the
+    # input HTML carries a valid data: URL.
+    html = f'<img src="{_png_data_url()}" width="100" height="50">'
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    # The image XObject is present in the raw PDF body (krilla emits
+    # `/Subtype /Image` in the dict header).
+    assert b"/Subtype /Image" in pdf, (
+        "expected /Subtype /Image XObject in PDF for data: URL"
+    )
+
+
+def test_pdf_with_broken_src_renders_alt_text():
+    # No data: URL — the renderer falls back to the alt attribute as text.
+    html = '<img src="https://example.com/nope.png" alt="missing image">'
+    pdf = quickpdf.html_to_pdf(html)
+    text = _pdf_text(pdf)
+    assert "missing image" in text, (
+        f"expected alt-text fallback, got {text!r}"
+    )
+    # And no image XObject was emitted.
+    assert b"/Subtype /Image" not in pdf, (
+        "broken src must not emit an Image XObject"
+    )
+
+
+def test_pdf_with_broken_src_and_no_alt_renders_blank():
+    pdf = quickpdf.html_to_pdf('<img src="garbage">')
+    assert pdf[:5] == b"%PDF-"
+    text = _pdf_text(pdf).strip()
+    # The page is otherwise empty — no image, no alt.
+    assert text == "", f"expected empty render, got {text!r}"
+    assert b"/Subtype /Image" not in pdf
+
+
+def test_pdf_image_inside_paragraph_splits_into_three_blocks():
+    # <p>before <img> after</p> renders as: "before" text → image → "after" text.
+    html = (
+        f'<p>before <img src="{_png_data_url()}" width="50" height="50"> after</p>'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    text = _pdf_text(pdf)
+    assert "before" in text
+    assert "after" in text
+    assert b"/Subtype /Image" in pdf
+
+
+def test_pdf_image_with_css_width_renders():
+    # CSS sizing path: width: 60px overrides the HTML width="120" attr.
+    html = (
+        '<style>img { width: 60px; }</style>'
+        f'<img src="{_png_data_url()}" width="120" height="120">'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    assert pdf[:5] == b"%PDF-"
+    assert b"/Subtype /Image" in pdf
+
+
+def test_pdf_image_with_decoration_emits_fill_and_image():
+    # padding + background → both a fill rect AND an image XObject.
+    html = (
+        '<style>img { background-color: yellow; padding: 6px; }</style>'
+        f'<img src="{_png_data_url()}" width="40" height="20">'
+    )
+    pdf = quickpdf.html_to_pdf(html)
+    streams = _pdf_content_streams(pdf)
+    assert "1 1 0 rg" in streams, "expected yellow background fill"
+    assert b"/Subtype /Image" in pdf
