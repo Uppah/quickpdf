@@ -1154,4 +1154,83 @@ mod tests {
         assert!((img.x - (b.x + 6.0)).abs() < 0.5);
         assert!((img.w - 40.0).abs() < 0.5);
     }
+
+    // ---- Phase 2b integrator: font handle threading. ----
+
+    /// Helper: base64-encode the bundled Inter so a test HTML can carry
+    /// a valid `data:font/ttf;base64,...` URL inside an @font-face block.
+    fn inter_data_url() -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(font::FALLBACK_TTF);
+        format!("data:font/ttf;base64,{b64}")
+    }
+
+    #[test]
+    fn no_font_face_lines_use_handle_zero() {
+        let pages = plan_full("<p>x</p>");
+        assert_eq!(pages.len(), 1);
+        let line = &pages[0].lines[0];
+        assert_eq!(line.font_handle, 0, "default font handle should be 0 (Inter)");
+    }
+
+    #[test]
+    fn font_family_with_no_face_falls_back_to_handle_zero() {
+        // Cascade resolves font-family but no @font-face registered "Acme",
+        // so the registry returns 0.
+        let pages = plan_full(r#"<p style="font-family: Acme">x</p>"#);
+        let line = &pages[0].lines[0];
+        assert_eq!(line.font_handle, 0);
+    }
+
+    #[test]
+    fn font_face_resolves_to_non_zero_handle() {
+        let url = inter_data_url();
+        let html = format!(
+            r#"<style>@font-face {{ font-family: "Acme"; src: url({url}); }}</style>
+<p style="font-family: Acme">x</p>"#
+        );
+        let pages = plan_full(&html);
+        let line = &pages[0].lines[0];
+        assert_ne!(line.font_handle, 0, "expected Acme to resolve to a non-zero handle");
+    }
+
+    #[test]
+    fn font_family_inherits_to_descendants() {
+        // section sets font-family Acme; the inner p has no font-family,
+        // so it inherits and resolves to the same non-zero handle.
+        let url = inter_data_url();
+        let html = format!(
+            r#"<style>@font-face {{ font-family: "Acme"; src: url({url}); }}
+                section {{ font-family: Acme; }}</style>
+<section><p>nested</p></section>"#
+        );
+        let pages = plan_full(&html);
+        let line = pages[0].lines.iter().find(|l| l.text == "nested").unwrap();
+        assert_ne!(line.font_handle, 0);
+    }
+
+    #[test]
+    fn font_family_chain_picks_first_registered() {
+        // Two @font-face blocks (Alpha and Beta). A paragraph with
+        // font-family: Beta, Alpha should pick Beta (first in the chain
+        // and registered). Switching the chain order should pick Alpha.
+        let url = inter_data_url();
+        let html = format!(
+            r#"<style>
+                @font-face {{ font-family: "Alpha"; src: url({url}); }}
+                @font-face {{ font-family: "Beta"; src: url({url}); }}
+            </style>
+            <p style="font-family: Beta, Alpha">first</p>
+            <p style="font-family: Alpha, Beta">second</p>"#
+        );
+        let pages = plan_full(&html);
+        let first = pages[0].lines.iter().find(|l| l.text == "first").unwrap();
+        let second = pages[0].lines.iter().find(|l| l.text == "second").unwrap();
+        assert_ne!(first.font_handle, 0);
+        assert_ne!(second.font_handle, 0);
+        assert_ne!(
+            first.font_handle, second.font_handle,
+            "chain order should select different handles"
+        );
+    }
 }

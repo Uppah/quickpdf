@@ -797,13 +797,29 @@ fn split_top_level_semicolons(body: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut pos = 0;
+    let mut paren_depth: i32 = 0;
     while pos < bytes.len() {
         let b = bytes[pos];
         match b {
-            b';' => {
+            b';' if paren_depth == 0 => {
                 out.push(&body[start..pos]);
                 pos += 1;
                 start = pos;
+            }
+            // Phase 2b: `;` is allowed inside `(...)` because the
+            // `data:font/ttf;base64,...` URL syntax embeds a literal
+            // semicolon. The pre-2b parser ignored paren depth and
+            // truncated such declaration values; tracking it here is
+            // a backwards-compatible fix.
+            b'(' => {
+                paren_depth += 1;
+                pos += 1;
+            }
+            b')' => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+                pos += 1;
             }
             b'"' | b'\'' => {
                 pos = skip_string(bytes, pos);
@@ -811,11 +827,6 @@ fn split_top_level_semicolons(body: &str) -> Vec<&str> {
             b'/' if pos + 1 < bytes.len() && bytes[pos + 1] == b'*' => {
                 pos = skip_ws_and_comments(bytes, pos);
             }
-            // A `(` introduces a balanced parenthesis run — used in `url(...)`,
-            // `calc(...)`, `var(...)`, etc. We don't actually parse these; we
-            // just don't want a `;` inside `url("a;b")` to split a declaration.
-            // (Strings inside already protect us, but bare `;` inside `(...)`
-            // is invalid CSS and there's no real-world example, so we leave it.)
             _ => pos += 1,
         }
     }
