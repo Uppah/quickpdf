@@ -111,6 +111,8 @@ pub fn apply_declarations(base: BlockStyle, decls: &[Declaration]) -> BlockStyle
             ("padding-left", ParsedValue::LengthEm(x)) => out.padding_left_em = x,
             ("border-width", ParsedValue::LengthEm(x)) => out.border_width_em = x,
             ("border-color", ParsedValue::Color(c)) => out.border_color = c,
+            ("width", ParsedValue::LengthEm(x)) => out.width_em = Some(x),
+            ("height", ParsedValue::LengthEm(x)) => out.height_em = Some(x),
             ("border-style", ParsedValue::BorderStyle(s)) => {
                 if s == BorderStyle::None {
                     out.border_width_em = 0.0;
@@ -136,6 +138,14 @@ pub fn parse_value(prop: &str, value: &str) -> Option<ParsedValue> {
         | "padding-bottom"
         | "padding-left"
         | "border-width" => parse_length_em(value).map(ParsedValue::LengthEm),
+        "width" | "height" => {
+            // Phase 2a: reject `%` because our cascade can't preserve the
+            // CSS percentage-of-containing-block semantic. See spec §3.
+            if value.trim_end().ends_with('%') {
+                return None;
+            }
+            parse_length_em(value).map(ParsedValue::LengthEm)
+        }
         "font-weight" => parse_weight(value).map(ParsedValue::Weight),
         "text-align" => parse_text_align(value).map(ParsedValue::TextAlign),
         "color" | "border-color" => parse_color(value).map(ParsedValue::Color),
@@ -914,5 +924,77 @@ mod tests {
         assert_eq!(s.margin_top_em, 0.25);
         assert_eq!(s.margin_bottom_em, 0.5);
         assert_eq!(s.indent_em, 0.75);
+    }
+
+    // ---- Phase 2a Slice C: width / height longhands. ----
+
+    #[test]
+    fn parse_value_accepts_width_and_height_lengths() {
+        // Same px / pt / em / rem path as padding-* and border-width.
+        assert_eq!(
+            parse_value("width", "120px"),
+            Some(ParsedValue::LengthEm(120.0 / 12.0))
+        );
+        assert_eq!(
+            parse_value("height", "5em"),
+            Some(ParsedValue::LengthEm(5.0))
+        );
+        assert_eq!(
+            parse_value("width", "24pt"),
+            Some(ParsedValue::LengthEm(24.0 / 12.0))
+        );
+        assert_eq!(
+            parse_value("height", "2rem"),
+            Some(ParsedValue::LengthEm(2.0))
+        );
+    }
+
+    #[test]
+    fn parse_value_rejects_percent_for_width_and_height() {
+        // CSS `width: 50%` resolves against the containing block, not the
+        // font-size. Our cascade can't preserve that without a richer Length
+        // type, so Phase 2a explicitly drops `%` for these properties.
+        assert_eq!(parse_value("width", "50%"), None);
+        assert_eq!(parse_value("width", "100%"), None);
+        assert_eq!(parse_value("height", "50%"), None);
+        // Sanity: `%` still works for font-size where it makes sense.
+        assert_eq!(
+            parse_value("font-size", "150%"),
+            Some(ParsedValue::LengthEm(1.5))
+        );
+    }
+
+    #[test]
+    fn apply_declarations_sets_width_and_height_em() {
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[d("width", "120px"), d("height", "60px")],
+        );
+        assert_eq!(out.width_em, Some(120.0 / 12.0));
+        assert_eq!(out.height_em, Some(60.0 / 12.0));
+    }
+
+    #[test]
+    fn apply_declarations_ignores_unparseable_width() {
+        // `width: auto` is a CSS keyword we don't honor in Phase 2a.
+        let out = apply_declarations(
+            BlockStyle::DEFAULT,
+            &[d("width", "auto"), d("height", "200px")],
+        );
+        assert!(out.width_em.is_none(), "width:auto must leave width_em as None");
+        assert_eq!(out.height_em, Some(200.0 / 12.0));
+    }
+
+    #[test]
+    fn width_height_not_inherited() {
+        let parent = BlockStyle {
+            width_em: Some(10.0),
+            height_em: Some(5.0),
+            ..BlockStyle::DEFAULT
+        };
+        let child = BlockStyle::DEFAULT;
+        let s = inherit(&parent, child);
+        assert!(s.width_em.is_none());
+        assert!(s.height_em.is_none());
     }
 }
