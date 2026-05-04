@@ -18,7 +18,7 @@ use krilla::geom::{PathBuilder, Point, Rect, Size};
 use krilla::paint::{Fill, Stroke};
 use krilla::page::PageSettings;
 use krilla::surface::Surface;
-use krilla::text::{Font, TextDirection};
+use krilla::text::TextDirection;
 use krilla::geom::Transform;
 use krilla::image::Image as KrillaImage;
 use thiserror::Error;
@@ -89,6 +89,10 @@ struct PlacedLine {
     font_size_pt: f32,
     text: String,
     color: Color,
+    /// Phase 2b: which registered font to use at emit time. Always
+    /// `0` for the bundled Inter fallback; non-zero for any
+    /// `@font-face`-resolved family.
+    font_handle: crate::font::FontHandle,
 }
 
 /// One placed box: rectangle to paint before any text on the page.
@@ -142,15 +146,17 @@ impl PagePlan {
 pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error> {
     let parsed = parse::Document::parse(html);
     let blocks = parsed.blocks();
-    let user_rules = parsed.user_stylesheet();
+    let stylesheet = parsed.stylesheet();
     let inline_owned = parsed.inline_styles();
     let inline_map: style::InlineStyles<'_> = inline_owned
         .iter()
         .map(|(id, decls)| (*id, decls.as_slice()))
         .collect();
 
-    let font = Font::new(font::FALLBACK_TTF.to_vec().into(), 0)
-        .ok_or_else(|| Error::Pdf("could not load embedded fallback font".into()))?;
+    // Phase 2b: build the font registry once per render. Inter is
+    // pre-registered at handle 0; @font-face blocks register additional
+    // faces under their lowercased family names.
+    let registry = font::FontRegistry::build(&stylesheet.font_faces);
 
     let mut document = Document::new_with(SerializeSettings::default());
     let (page_w, page_h) = options.page_size.dimensions();
@@ -163,8 +169,9 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
     let pages = plan_pages_styled(
         &parsed,
         &blocks,
-        &user_rules,
+        &stylesheet.rules,
         &inline_map,
+        &registry,
         content_width,
         MARGIN_PT,
         bottom_limit,
@@ -191,6 +198,7 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
             }
 
             let mut current_color: Option<Color> = None;
+            let mut current_handle: Option<crate::font::FontHandle> = None;
             for line in &page_plan.lines {
                 if current_color != Some(line.color) {
                     let fill = Fill {
@@ -205,9 +213,13 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
                     surface.set_fill(Some(fill));
                     current_color = Some(line.color);
                 }
+                if current_handle != Some(line.font_handle) {
+                    current_handle = Some(line.font_handle);
+                }
+                let font_for_line = registry.fonts[line.font_handle].krilla_font.clone();
                 surface.draw_text(
                     Point::from_xy(line.x, line.y),
-                    font.clone(),
+                    font_for_line,
                     line.font_size_pt,
                     &line.text,
                     false,
@@ -300,6 +312,7 @@ fn plan_pages_styled(
     blocks: &[parse::Block],
     user_rules: &[style::sheet::Rule],
     inline: &style::InlineStyles<'_>,
+    registry: &font::FontRegistry,
     content_width: f32,
     left_margin: f32,
     bottom_limit: f32,
@@ -316,7 +329,7 @@ fn plan_pages_styled(
             parse::Block::Text(t) => t,
             parse::Block::Image(img_block) => {
                 place_image_block(
-                    doc, block, img_block, user_rules, inline,
+                    doc, block, img_block, user_rules, inline, registry,
                     left_margin, content_width, bottom_limit, page_content_height,
                     &mut pages, &mut current, &mut cursor_y,
                 )?;
@@ -341,7 +354,12 @@ fn plan_pages_styled(
         let text_x = box_left + border_w + pad_left;
         let text_width = (box_width - 2.0 * border_w - pad_left - pad_right).max(1.0);
 
-        let metrics = text::TextMetrics::new(font::FALLBACK_TTF, font_size)
+        let font_handle = registry.lookup(
+            style.font_family.as_deref().unwrap_or(&[]),
+        );
+        let font_bytes: &[u8] = &registry.fonts[font_handle].bytes;
+
+        let metrics = text::TextMetrics::new(font_bytes, font_size)
             .ok_or_else(|| Error::Pdf("could not measure font at requested size".into()))?;
         let lines = text::wrap_lines(&metrics, &para.text, text_width);
         if lines.is_empty() {
@@ -400,6 +418,7 @@ fn plan_pages_styled(
                     font_size_pt: font_size,
                     text: line,
                     color: style.color,
+                    font_handle,
                 });
             }
             cursor_y = Some(box_top + block_height_total);
@@ -423,6 +442,7 @@ fn plan_pages_styled(
                     font_size_pt: font_size,
                     text: line,
                     color: style.color,
+                    font_handle,
                 });
                 cursor_y = Some(final_y + line_height);
             }
@@ -460,6 +480,7 @@ fn place_image_block(
     img_block: &parse::ImageBlock,
     user_rules: &[style::sheet::Rule],
     inline: &style::InlineStyles<'_>,
+    registry: &font::FontRegistry,
     left_margin: f32,
     content_width: f32,
     bottom_limit: f32,
@@ -496,7 +517,11 @@ fn place_image_block(
             // cursor position using the same text-flow logic the text path
             // would use for an anonymous paragraph at default style.
             if let Some(alt) = img_block.alt.as_deref().filter(|s| !s.is_empty()) {
-                let metrics = text::TextMetrics::new(font::FALLBACK_TTF, font_size)
+                let font_handle = registry.lookup(
+                    style.font_family.as_deref().unwrap_or(&[]),
+                );
+                let font_bytes: &[u8] = &registry.fonts[font_handle].bytes;
+                let metrics = text::TextMetrics::new(font_bytes, font_size)
                     .ok_or_else(|| Error::Pdf("fallback metrics".into()))?;
                 let lines = text::wrap_lines(&metrics, alt, content_width);
                 if lines.is_empty() {
@@ -518,6 +543,7 @@ fn place_image_block(
                         font_size_pt: font_size,
                         text: line,
                         color: style.color,
+                        font_handle,
                     });
                     *cursor_y = Some(final_y + line_height);
                 }
@@ -641,13 +667,14 @@ mod tests {
     fn plan_full(html: &str) -> Vec<PagePlan> {
         let doc = parse::Document::parse(html);
         let blocks = doc.blocks();
-        let rules = doc.user_stylesheet();
+        let stylesheet = doc.stylesheet();
         let inline_owned = doc.inline_styles();
         let inline_map: style::InlineStyles<'_> = inline_owned
             .iter()
             .map(|(id, decls)| (*id, decls.as_slice()))
             .collect();
-        plan_pages_styled(&doc, &blocks, &rules, &inline_map, 500.0, 36.0, 800.0).unwrap()
+        let registry = font::FontRegistry::build(&stylesheet.font_faces);
+        plan_pages_styled(&doc, &blocks, &stylesheet.rules, &inline_map, &registry, 500.0, 36.0, 800.0).unwrap()
     }
 
     #[test]
