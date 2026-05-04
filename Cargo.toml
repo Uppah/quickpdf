@@ -31,6 +31,11 @@ skrifa = "0.37"
 # direct import for `NodeId`.
 ego-tree = "0.11"
 
+# Phase 2a: data-URL decoding for <img src="data:image/png;base64,...">.
+# Pinned to "=0.22.1" because krilla 0.7 declares base64 = "0.22.1" directly;
+# pinning prevents a duplicate base64 tree in the wheel.
+base64 = "=0.22.1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
