@@ -154,6 +154,13 @@ pub struct BlockStyle {
     pub border_width_em: f32,
     /// Border colour. Used only when `border_width_em > 0`.
     pub border_color: Color,
+    /// Author-set width in em (relative to the block's resolved font
+    /// size). `None` means "no explicit width" — layout falls back to
+    /// HTML attrs or intrinsic dimensions. Phase 2a only sets this for
+    /// `<img>`; in future phases other block types may consume it.
+    pub width_em: Option<f32>,
+    /// Author-set height in em. Same semantics as `width_em`.
+    pub height_em: Option<f32>,
 }
 
 impl BlockStyle {
@@ -172,6 +179,8 @@ impl BlockStyle {
         padding_left_em: 0.0,
         border_width_em: 0.0,
         border_color: Color::BLACK,
+        width_em: None,
+        height_em: None,
     };
 }
 

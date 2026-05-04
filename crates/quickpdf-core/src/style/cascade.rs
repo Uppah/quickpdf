@@ -356,6 +356,8 @@ pub struct BlockStyleBuilder {
     pub padding_left_em: Option<f32>,
     pub border_width_em: Option<f32>,
     pub border_color: Option<Color>,
+    pub width_em: Option<Option<f32>>,
+    pub height_em: Option<Option<f32>>,
 }
 
 impl BlockStyleBuilder {
@@ -379,6 +381,8 @@ impl BlockStyleBuilder {
             padding_left_em: Some(style.padding_left_em),
             border_width_em: Some(style.border_width_em),
             border_color: Some(style.border_color),
+            width_em: Some(style.width_em),
+            height_em: Some(style.height_em),
         }
     }
 
@@ -406,6 +410,8 @@ impl BlockStyleBuilder {
             padding_left_em: self.padding_left_em.unwrap_or(def.padding_left_em),
             border_width_em: self.border_width_em.unwrap_or(def.border_width_em),
             border_color: self.border_color.unwrap_or(def.border_color),
+            width_em: self.width_em.unwrap_or(def.width_em),
+            height_em: self.height_em.unwrap_or(def.height_em),
         }
     }
 }
@@ -444,6 +450,9 @@ pub fn inherit(parent: &BlockStyle, child: BlockStyle) -> BlockStyle {
         padding_left_em: child.padding_left_em,
         border_width_em: child.border_width_em,
         border_color: child.border_color,
+        // Width/height are not inherited per CSS — pass child's through.
+        width_em: child.width_em,
+        height_em: child.height_em,
     }
 }
 
