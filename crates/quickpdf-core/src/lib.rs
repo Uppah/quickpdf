@@ -270,7 +270,7 @@ fn paint_box(surface: &mut Surface, b: &PlacedBox) {
 ///   so geometry stays consistent.
 fn plan_pages_styled(
     doc: &parse::Document,
-    paragraphs: &[parse::Paragraph],
+    paragraphs: &[parse::TextBlock],
     user_rules: &[style::sheet::Rule],
     inline: &style::InlineStyles<'_>,
     content_width: f32,

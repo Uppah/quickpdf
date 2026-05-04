@@ -84,7 +84,7 @@ impl Document {
     /// Visible text grouped into paragraphs, each tagged with the element
     /// whose inline content it represents. Retained for transition tests;
     /// new callers should use `blocks()` and match on `Block::Text`.
-    pub fn paragraphs(&self) -> Vec<Paragraph> {
+    pub fn paragraphs(&self) -> Vec<TextBlock> {
         self.blocks()
             .into_iter()
             .filter_map(|b| match b {
@@ -106,11 +106,11 @@ impl Document {
     /// Returns `None` if the handle is stale (which shouldn't happen — the
     /// `Document` owns the tree — but we treat it defensively).
     ///
-    /// Takes `&Paragraph` (= `&TextBlock`) for backward compatibility with
+    /// Takes `&TextBlock` for backward compatibility with
     /// lib.rs during the T5→T10 transition. T10 (integrator) updates this
     /// to take `&Block` once all callers are migrated.
     #[deprecated(note = "use element_for_block(&Block); this transition shim is removed when lib.rs migrates in Plan T10")]
-    pub fn element_for(&self, p: &Paragraph) -> Option<ElementRef<'_>> {
+    pub fn element_for(&self, p: &TextBlock) -> Option<ElementRef<'_>> {
         let node = self.html.tree.get(p.element_id)?;
         ElementRef::wrap(node)
     }
@@ -183,10 +183,6 @@ pub struct ImageBlock {
     pub height_attr: Option<f32>,
     pub alt: Option<String>,
 }
-
-// Backwards alias retained only for transition tests inside this file.
-// Removed in Slice B step 4.
-pub type Paragraph = TextBlock;
 
 /// Internal helper: drop the now-internal `Element` import warning when only
 /// some functions use it. Keep this unused-but-public access pattern explicit
@@ -481,10 +477,13 @@ mod tests {
     #[test]
     fn paragraphs_tag_each_block() {
         let d = Document::parse("<h1>Title</h1><p>body</p><ul><li>x</li></ul>");
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         let tagged: Vec<(&str, &str)> = ps
             .iter()
-            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .filter_map(|b| match b {
+                Block::Text(t) => Some((t.tag.as_str(), t.text.as_str())),
+                Block::Image(_) => None,
+            })
             .collect();
         assert_eq!(
             tagged,
@@ -496,7 +495,10 @@ mod tests {
     fn paragraphs_skip_block_containers() {
         // <div> wraps <p>, so the only paragraph reported is the <p>.
         let d = Document::parse("<div><p>only this</p></div>");
-        let ps = d.paragraphs();
+        let ps: Vec<_> = d.blocks().into_iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            Block::Image(_) => None,
+        }).collect();
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].tag, "p");
         assert_eq!(ps[0].text, "only this");
@@ -510,10 +512,13 @@ mod tests {
     #[test]
     fn anonymous_wraps_orphan_text_around_block_child() {
         let d = Document::parse("<div>before<p>middle</p>after</div>");
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         let tagged: Vec<(&str, &str)> = ps
             .iter()
-            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .filter_map(|b| match b {
+                Block::Text(t) => Some((t.tag.as_str(), t.text.as_str())),
+                Block::Image(_) => None,
+            })
             .collect();
         assert_eq!(
             tagged,
@@ -526,19 +531,18 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn anonymous_uses_parent_element_id() {
         let d = Document::parse("<div>before<p>middle</p>after</div>");
-        let ps = d.paragraphs();
-        // Find the parent <div> and assert the anonymous paragraphs
-        // resolve back through Document::element_for to that <div>.
-        let anon: Vec<&Paragraph> = ps
+        let ps = d.blocks();
+        // Find the parent <div> and assert the anonymous blocks
+        // resolve back through Document::element_for_block to that <div>.
+        let anon: Vec<&Block> = ps
             .iter()
-            .filter(|p| p.tag == ANONYMOUS_TAG)
+            .filter(|b| matches!(b, Block::Text(t) if t.tag == ANONYMOUS_TAG))
             .collect();
         assert_eq!(anon.len(), 2);
         for a in anon {
-            let resolved = d.element_for(a).expect("anon element_id resolves");
+            let resolved = d.element_for_block(a).expect("anon element_id resolves");
             assert_eq!(resolved.value().name(), "div");
         }
     }
@@ -546,7 +550,10 @@ mod tests {
     #[test]
     fn anonymous_drops_whitespace_only_runs() {
         let d = Document::parse("<div>   <p>x</p>   </div>");
-        let ps = d.paragraphs();
+        let ps: Vec<_> = d.blocks().into_iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            Block::Image(_) => None,
+        }).collect();
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].tag, "p");
         assert_eq!(ps[0].text, "x");
@@ -557,7 +564,10 @@ mod tests {
         // <div>only text</div> has no block children → still a leaf-block
         // tagged "div", same as before Phase 1.6c.
         let d = Document::parse("<div>only text</div>");
-        let ps = d.paragraphs();
+        let ps: Vec<_> = d.blocks().into_iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            Block::Image(_) => None,
+        }).collect();
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].tag, "div");
         assert_eq!(ps[0].text, "only text");
@@ -566,7 +576,10 @@ mod tests {
     #[test]
     fn pure_block_container_unchanged() {
         let d = Document::parse("<div><p>only</p></div>");
-        let ps = d.paragraphs();
+        let ps: Vec<_> = d.blocks().into_iter().filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            Block::Image(_) => None,
+        }).collect();
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].tag, "p");
         assert_eq!(ps[0].text, "only");
@@ -577,10 +590,13 @@ mod tests {
         let d = Document::parse(
             "<div>before<p>p1</p>between<p>p2</p>after</div>",
         );
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         let tagged: Vec<(&str, &str)> = ps
             .iter()
-            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .filter_map(|b| match b {
+                Block::Text(t) => Some((t.tag.as_str(), t.text.as_str())),
+                Block::Image(_) => None,
+            })
             .collect();
         assert_eq!(
             tagged,
@@ -597,10 +613,13 @@ mod tests {
     #[test]
     fn inline_elements_feed_anonymous_buffer() {
         let d = Document::parse("<div>a<span>b</span><p>c</p>d</div>");
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         let tagged: Vec<(&str, &str)> = ps
             .iter()
-            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .filter_map(|b| match b {
+                Block::Text(t) => Some((t.tag.as_str(), t.text.as_str())),
+                Block::Image(_) => None,
+            })
             .collect();
         assert_eq!(
             tagged,
@@ -613,7 +632,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn nested_anonymous_uses_correct_parent_id() {
         // Outer div has an anon "x" tied to the div, plus a <section>
         // that itself has mixed content → anon "y" tied to the section,
@@ -621,21 +639,36 @@ mod tests {
         let d = Document::parse(
             "<div>x<section>y<p>z</p></section></div>",
         );
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         assert_eq!(ps.len(), 3);
 
-        assert_eq!(ps[0].tag, ANONYMOUS_TAG);
-        assert_eq!(ps[0].text, "x");
-        let parent0 = d.element_for(&ps[0]).unwrap();
-        assert_eq!(parent0.value().name(), "div");
+        match &ps[0] {
+            Block::Text(t) => {
+                assert_eq!(t.tag, ANONYMOUS_TAG);
+                assert_eq!(t.text, "x");
+                let parent0 = d.element_for_block(&ps[0]).unwrap();
+                assert_eq!(parent0.value().name(), "div");
+            }
+            Block::Image(_) => panic!("expected text block"),
+        }
 
-        assert_eq!(ps[1].tag, ANONYMOUS_TAG);
-        assert_eq!(ps[1].text, "y");
-        let parent1 = d.element_for(&ps[1]).unwrap();
-        assert_eq!(parent1.value().name(), "section");
+        match &ps[1] {
+            Block::Text(t) => {
+                assert_eq!(t.tag, ANONYMOUS_TAG);
+                assert_eq!(t.text, "y");
+                let parent1 = d.element_for_block(&ps[1]).unwrap();
+                assert_eq!(parent1.value().name(), "section");
+            }
+            Block::Image(_) => panic!("expected text block"),
+        }
 
-        assert_eq!(ps[2].tag, "p");
-        assert_eq!(ps[2].text, "z");
+        match &ps[2] {
+            Block::Text(t) => {
+                assert_eq!(t.tag, "p");
+                assert_eq!(t.text, "z");
+            }
+            Block::Image(_) => panic!("expected text block"),
+        }
     }
 
     #[test]
@@ -645,10 +678,13 @@ mod tests {
         let d = Document::parse(
             "<div>a<script>NOPE</script><p>b</p><style>x{color:red}</style>c</div>",
         );
-        let ps = d.paragraphs();
+        let ps = d.blocks();
         let tagged: Vec<(&str, &str)> = ps
             .iter()
-            .map(|p| (p.tag.as_str(), p.text.as_str()))
+            .filter_map(|b| match b {
+                Block::Text(t) => Some((t.tag.as_str(), t.text.as_str())),
+                Block::Image(_) => None,
+            })
             .collect();
         assert_eq!(
             tagged,
@@ -737,20 +773,19 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn inline_styles_node_id_resolves_via_element_for() {
-        // Build a synthetic Paragraph with the inline-style NodeId and
-        // confirm element_for round-trips back to the right element.
+        // Build a synthetic Block::Text with the inline-style NodeId and
+        // confirm element_for_block round-trips back to the right element.
         let d = Document::parse(r#"<p style="color: red">x</p>"#);
         let inline = d.inline_styles();
         assert_eq!(inline.len(), 1);
         let node_id = inline[0].0;
-        let synthetic = Paragraph {
+        let synthetic = Block::Text(TextBlock {
             tag: "p".to_string(),
             text: "x".to_string(),
             element_id: node_id,
-        };
-        let resolved = d.element_for(&synthetic).expect("node id resolves");
+        });
+        let resolved = d.element_for_block(&synthetic).expect("node id resolves");
         assert_eq!(resolved.value().name(), "p");
         // The resolved element's own NodeId matches the one we collected.
         assert_eq!(resolved.id(), node_id);
