@@ -125,7 +125,7 @@ impl PagePlan {
 /// is Phase 1.6c.
 pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error> {
     let parsed = parse::Document::parse(html);
-    let paragraphs = parsed.paragraphs();
+    let blocks = parsed.blocks();
     let user_rules = parsed.user_stylesheet();
     let inline_owned = parsed.inline_styles();
     let inline_map: style::InlineStyles<'_> = inline_owned
@@ -146,7 +146,7 @@ pub fn html_to_pdf(html: &str, options: &RenderOptions) -> Result<Vec<u8>, Error
 
     let pages = plan_pages_styled(
         &parsed,
-        &paragraphs,
+        &blocks,
         &user_rules,
         &inline_map,
         content_width,
@@ -270,7 +270,7 @@ fn paint_box(surface: &mut Surface, b: &PlacedBox) {
 ///   so geometry stays consistent.
 fn plan_pages_styled(
     doc: &parse::Document,
-    paragraphs: &[parse::TextBlock],
+    blocks: &[parse::Block],
     user_rules: &[style::sheet::Rule],
     inline: &style::InlineStyles<'_>,
     content_width: f32,
@@ -284,8 +284,14 @@ fn plan_pages_styled(
     let mut current = PagePlan::default();
     let mut cursor_y: Option<f32> = None;
 
-    for para in paragraphs {
-        let style = match doc.element_for(para) {
+    for block in blocks {
+        // Phase 2a: image branch is added in Task 12. For now, skip non-text
+        // blocks so the existing text-rendering tests stay green.
+        let para = match block {
+            parse::Block::Text(t) => t,
+            parse::Block::Image(_) => continue,
+        };
+        let style = match doc.element_for_block(block) {
             Some(elem) => style::resolve(elem, user_rules, inline),
             None => style::ua_style(&para.tag),
         };
@@ -419,14 +425,14 @@ mod tests {
     /// Used by the Phase 1.7b box-model tests below.
     fn plan_full(html: &str) -> Vec<PagePlan> {
         let doc = parse::Document::parse(html);
-        let paragraphs = doc.paragraphs();
+        let blocks = doc.blocks();
         let rules = doc.user_stylesheet();
         let inline_owned = doc.inline_styles();
         let inline_map: style::InlineStyles<'_> = inline_owned
             .iter()
             .map(|(id, decls)| (*id, decls.as_slice()))
             .collect();
-        plan_pages_styled(&doc, &paragraphs, &rules, &inline_map, 500.0, 36.0, 800.0).unwrap()
+        plan_pages_styled(&doc, &blocks, &rules, &inline_map, 500.0, 36.0, 800.0).unwrap()
     }
 
     #[test]
