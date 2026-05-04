@@ -74,9 +74,10 @@ quickpdf/
 │   │   ├── assets/fonts/Inter-Regular.ttf  ← bundled, OFL-licensed
 │   │   └── src/
 │   │       ├── lib.rs               # html_to_pdf entrypoint + plan_pages_styled
-│   │       ├── parse.rs             # html5ever DOM walker, paragraphs(), inline_styles()
+│   │       ├── parse.rs             # html5ever DOM walker, blocks(), inline_styles()
 │   │       ├── font.rs              # FALLBACK_TTF (include_bytes!)
 │   │       ├── text.rs              # TextMetrics, wrap_lines (greedy word-wrap)
+│   │       ├── image.rs             # parse_data_url for data:image/png|jpeg URLs (Phase 2a)
 │   │       └── style/               # CSS pipeline (Phase 1.6 + 1.7 family)
 │   │           ├── mod.rs           # BlockStyle, ua_style, resolve, InlineStyles
 │   │           ├── sheet.rs         # CSS parser → Vec<Rule>; shorthand expansion; inline parser
@@ -127,7 +128,7 @@ quickpdf/
   project — it's not an optimisation, it's a defection to Track A.
 - **Keep skrifa pinned to krilla's version.** Mismatch produces two skrifa
   copies in the binary (bigger wheel, slower build).
-- **`Paragraph.element_id` is a stable handle.** Use `Document::element_for(p)`
+- **`Block::element_id()` is a stable handle.** Use `Document::element_for_block(b)`
   to recover the `ElementRef` for cascade matching; never fabricate `NodeId`s.
 - **Font bundling.** `crates/quickpdf-core/assets/fonts/Inter-Regular.ttf` is
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next

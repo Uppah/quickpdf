@@ -4,7 +4,6 @@
 //! Phase 1.2+ adds metadata (font/style hints) needed by layout.
 
 use scraper::{ElementRef, Html, Node};
-use scraper::node::Element;
 use ego_tree::NodeId;
 
 use crate::style::sheet::{self, Declaration, Rule};
@@ -81,19 +80,6 @@ impl Document {
         out
     }
 
-    /// Visible text grouped into paragraphs, each tagged with the element
-    /// whose inline content it represents. Retained for transition tests;
-    /// new callers should use `blocks()` and match on `Block::Text`.
-    pub fn paragraphs(&self) -> Vec<TextBlock> {
-        self.blocks()
-            .into_iter()
-            .filter_map(|b| match b {
-                Block::Text(t) => Some(t),
-                Block::Image(_) => None,
-            })
-            .collect()
-    }
-
     /// Parse all `<style>` blocks in the document into a flat rule list.
     /// Phase 1.6b: inline `<style>` only — external `<link rel="stylesheet">`
     /// arrives in Phase 1.6c. Cheap to call (linear in stylesheet length);
@@ -102,21 +88,9 @@ impl Document {
         sheet::parse_stylesheet(&sheet::collect_style_blocks(self))
     }
 
-    /// Resolve a block's element handle back to a live `ElementRef`.
+    /// Resolve any `Block`'s element handle back to a live `ElementRef`.
     /// Returns `None` if the handle is stale (which shouldn't happen — the
     /// `Document` owns the tree — but we treat it defensively).
-    ///
-    /// Takes `&TextBlock` for backward compatibility with
-    /// lib.rs during the T5→T10 transition. T10 (integrator) updates this
-    /// to take `&Block` once all callers are migrated.
-    #[deprecated(note = "use element_for_block(&Block); this transition shim is removed when lib.rs migrates in Plan T10")]
-    pub fn element_for(&self, p: &TextBlock) -> Option<ElementRef<'_>> {
-        let node = self.html.tree.get(p.element_id)?;
-        ElementRef::wrap(node)
-    }
-
-    /// New API: resolve any `Block`'s element handle back to a live
-    /// `ElementRef`. Replaces `element_for` once `lib.rs` is updated (T10).
     pub fn element_for_block(&self, b: &Block) -> Option<ElementRef<'_>> {
         let node = self.html.tree.get(b.element_id())?;
         ElementRef::wrap(node)
@@ -182,14 +156,6 @@ pub struct ImageBlock {
     pub width_attr: Option<f32>,
     pub height_attr: Option<f32>,
     pub alt: Option<String>,
-}
-
-/// Internal helper: drop the now-internal `Element` import warning when only
-/// some functions use it. Keep this unused-but-public access pattern explicit
-/// so future module changes don't accidentally drop the import.
-#[allow(dead_code)]
-fn _force_element_ref<'a>(e: &'a Element) -> &'a Element {
-    e
 }
 
 fn is_skipped(tag: &str) -> bool {
