@@ -145,18 +145,77 @@ pub fn parse_stylesheet(source: &str) -> Vec<Rule> {
 
 /// Try to recognise an `@font-face` rule starting at `bytes[pos] == b'@'`.
 /// Returns `Some((face, next_pos))` on a successful capture, or `None`
-/// if this isn't an `@font-face` rule (or it's malformed) — in which
-/// case the caller falls back to `skip_at_rule` to consume it.
+/// if this isn't an `@font-face` rule — in which case the caller falls
+/// back to `skip_at_rule` to consume it.
 ///
-/// Phase 2b Task 5 wires up the real recogniser. Until then this stub
-/// always returns `None` so existing behavior is unchanged.
+/// Recognition: the byte after `@` plus the next 9 ASCII bytes are
+/// matched case-insensitively against `"font-face"`. Whitespace and
+/// comments may follow before the `{`. If the keyword matches but no
+/// `{` follows (truncated input, syntax error), we still return None
+/// so the caller's `skip_at_rule` consumes the malformed remainder.
 fn try_capture_font_face(
-    _source: &str,
-    _bytes: &[u8],
-    _pos: usize,
-    _source_order: usize,
+    source: &str,
+    bytes: &[u8],
+    pos: usize,
+    source_order: usize,
 ) -> Option<(FontFace, usize)> {
-    None
+    debug_assert_eq!(bytes.get(pos), Some(&b'@'));
+
+    // 1. Match the keyword (case-insensitive) at bytes[pos+1..pos+10].
+    const KEYWORD: &[u8] = b"font-face";
+    if pos + 1 + KEYWORD.len() > bytes.len() {
+        return None;
+    }
+    for (i, want) in KEYWORD.iter().enumerate() {
+        let got = bytes[pos + 1 + i];
+        if !got.eq_ignore_ascii_case(want) {
+            return None;
+        }
+    }
+
+    // 2. After the keyword, the next char must be whitespace, `{`, or
+    //    comment-start. Anything else (e.g. `@font-face-extra`) means
+    //    we matched a prefix of a different at-rule — bail out.
+    let after_kw = pos + 1 + KEYWORD.len();
+    if after_kw < bytes.len() {
+        let c = bytes[after_kw];
+        let ok = is_css_ws(c) || c == b'{' || (c == b'/' && bytes.get(after_kw + 1) == Some(&b'*'));
+        if !ok {
+            return None;
+        }
+    }
+
+    // 3. Skip whitespace + comments to find the `{`.
+    let mut p = skip_ws_and_comments(bytes, after_kw);
+    if p >= bytes.len() || bytes[p] != b'{' {
+        // Keyword matched but no opening brace before EOF/garbage. Caller's
+        // `skip_at_rule` fallback handles the cleanup.
+        return None;
+    }
+
+    // 4. Walk the balanced block; capture the body for declaration parsing.
+    let block_open = p;
+    let block_close_plus_one = skip_balanced_block(bytes, block_open);
+    // Reuse the same closer-validation that read_qualified_rule uses: if
+    // the block never closed, we treat the whole stream as truncated and
+    // bail (caller's skip_at_rule will eat to EOF too).
+    if block_close_plus_one == bytes.len() && !ends_with_close_brace(bytes, block_close_plus_one) {
+        return None;
+    }
+    p = block_close_plus_one;
+
+    let body_start = block_open + 1;
+    let body_end = block_close_plus_one.saturating_sub(1).max(body_start);
+    let body = &source[body_start..body_end];
+    let declarations = parse_declaration_block(body);
+
+    Some((
+        FontFace {
+            declarations,
+            source_order,
+        },
+        p,
+    ))
 }
 
 /// Walk the parsed HTML and return the concatenated text content of every
@@ -1295,5 +1354,85 @@ mod tests {
             assert_eq!(a.selector_text, l.selector_text);
             assert_eq!(a.source_order, l.source_order);
         }
+    }
+
+    #[test]
+    fn font_face_basic_block_captured() {
+        let src = "@font-face { font-family: Acme; src: url(data:font/ttf;base64,AAA); }";
+        let sheet = parse_stylesheet_full(src);
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.rules.len(), 0);
+        let face = &sheet.font_faces[0];
+        assert_eq!(face.source_order, 0);
+        // Both descriptors land in the declaration list, normalised by
+        // parse_declaration_block.
+        let names: Vec<&str> = face.declarations.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"font-family"));
+        assert!(names.contains(&"src"));
+    }
+
+    #[test]
+    fn font_face_keyword_is_case_insensitive() {
+        for variant in ["@font-face", "@Font-Face", "@FONT-FACE", "@fOnT-fAcE"] {
+            let src = format!("{variant} {{ font-family: A; src: url(x); }}");
+            let sheet = parse_stylesheet_full(&src);
+            assert_eq!(sheet.font_faces.len(), 1, "variant {variant} not recognised");
+        }
+    }
+
+    #[test]
+    fn font_face_tolerates_whitespace_before_brace() {
+        let src = "@font-face\n  \t{ font-family: Acme; src: url(x); }";
+        let sheet = parse_stylesheet_full(src);
+        assert_eq!(sheet.font_faces.len(), 1);
+    }
+
+    #[test]
+    fn font_face_source_order_is_shared_with_rules() {
+        // Three top-level items: rule, font-face, rule. Source order
+        // assignments must be 0, 1, 2 in that interleaved order.
+        let src = "p { color: red; } \
+                   @font-face { font-family: A; src: url(x); } \
+                   h1 { color: blue; }";
+        let sheet = parse_stylesheet_full(src);
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.rules[0].source_order, 0);   // p
+        assert_eq!(sheet.font_faces[0].source_order, 1); // @font-face
+        assert_eq!(sheet.rules[1].source_order, 2);   // h1
+    }
+
+    #[test]
+    fn font_face_unterminated_block_dropped_silently() {
+        // No closing brace — must not panic, must not corrupt subsequent
+        // parsing. Phase 2b's policy: drop the malformed @font-face and
+        // any tail content inside it (the caller's `skip_at_rule`
+        // fallback consumes through the next balanced } or EOF).
+        let src = "@font-face { font-family: A; src: url(x); /* no closer */ ";
+        let sheet = parse_stylesheet_full(src);
+        // No crash; no faces captured.
+        assert_eq!(sheet.font_faces.len(), 0);
+    }
+
+    #[test]
+    fn font_face_other_at_rules_still_dropped() {
+        // @media, @import, etc. continue to be silently skipped — only
+        // @font-face is carved out.
+        let src = "@media print { p { x: y; } } \
+                   @font-face { font-family: A; src: url(x); } \
+                   @import url('foo.css');";
+        let sheet = parse_stylesheet_full(src);
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.rules.len(), 0);
+    }
+
+    #[test]
+    fn font_face_empty_block_yields_empty_declarations() {
+        // `@font-face { }` is technically valid CSS but useless. The
+        // registry will drop it (no font-family). At the parser layer
+        // we capture it with an empty declaration list.
+        let sheet = parse_stylesheet_full("@font-face { }");
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.font_faces[0].declarations.len(), 0);
     }
 }
