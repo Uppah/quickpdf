@@ -31,13 +31,15 @@ something genuinely new, not another browser wrapper.
 | 1.7a  |   ✓    | `color` property: parser (named/hex/rgb/rgba), inherited, plumbed into krilla fill   |
 | 1.7b  |   ✓    | `background-color`, `padding-*`, `border-*` via PlacedBox paint pass                 |
 | 1.7c  |   ✓    | `rem` unit, padding/margin/border shorthand, inline `style="..."` (4-tuple specificity) |
-|   2   |   →    | **NEXT.** Tables, images, web fonts → renders email-style HTML                       |
+|  2a   |   ✓    | Block-level `<img>` (PNG/JPEG via `data:` URL, HTML+CSS sizing, alt fallback)         |
+|  2b   |   →    | **NEXT.** Web fonts via `@font-face`                                                  |
+|  2c   |        | Tables (`<table>`/`<tr>`/`<td>`) — proper 2D layout                                    |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf` v0.1                        |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel                                   |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS                              |
 
-**Test posture today:** 161 Rust unit tests + 44 Python integration tests, all
-green in ~0.3 s combined.
+**Test posture today:** 189 Rust unit tests + 50 Python integration tests, all
+green in ~0.5 s combined.
 
 ## Build + test (always)
 
@@ -131,43 +133,32 @@ quickpdf/
   embedded via `include_bytes!`. The OFL `Inter-Regular.LICENSE.txt` lives next
   to it and **must be preserved on any redistribution**.
 
-## Next session: Phase 2
+## Next session: Phase 2b — web fonts
 
-Phase 1.7 is complete. Phase 2 begins the "renders email-style HTML"
-push: tables (`<table>`/`<tr>`/`<td>`), images (`<img>` with raster +
-data URLs), and web fonts (`@font-face`).
+Phase 2a is complete. Phase 2b adds `@font-face` parsing in
+`sheet.rs::skip_at_rule` (currently dropped) and threads custom
+`Font` instances through `font.rs` and the planner. Slice plan to
+follow once brainstorming nails down scope (system-font fallback?
+Embed only Latin subset of `@font-face` payloads? Rejection on
+unsupported font formats?).
 
-- **Tables** are the first feature where layout actually has to compute
-  a 2D box geometry rather than stacking blocks. Plan ahead: `taffy`
-  is the obvious crate, but a hand-rolled fixed-table-layout pass may
-  ship faster for the email-template subset.
-- **Images** mean adding a decoder dependency (`image` crate) and
-  teaching krilla about pixel buffers. Data URLs (`data:image/...`)
-  come for free once the decoder is wired.
-- **Web fonts** require parsing `@font-face` (currently dropped by the
-  at-rule skipper in `sheet.rs::skip_at_rule`) and threading custom
-  `Font` instances through the planner.
+Cross-cutting Phase 2a artefacts to keep in mind for future phases:
 
-Cross-cutting Phase 1.7c artefacts to keep in mind for future phases:
-
-- `Specificity` is now a 4-tuple `(inline, id, class, tag)` with
-  `Specificity::INLINE = (1, 0, 0, 0)`. New cascade origins should pick
-  a slot above bucket 0 if needed (CSS spec: user-agent < user < author,
-  with !important reversing among origins). For now everything shares
-  the author-bucket sort order.
-- `style::InlineStyles<'a>` is the seam between `parse::Document::inline_styles()`
-  and the cascade. The integrator builds this map once per render and
-  threads it through `plan_pages_styled`.
-- Shorthand expansion happens at parse time inside
-  `sheet::parse_declaration_block`, so author rules and inline styles
-  both feed only longhand declarations into the cascade. Adding a new
-  shorthand is one helper plus a handful of tests; no cascade work needed.
-- `rem` resolves to `1em` until `:root` cascade lands. Phase 4 should
-  add proper `:root font-size` resolution.
-
-Known 1.7b limitation worth fixing later: a decorated block taller than
-a single page falls back to streaming-without-box. Phase 4 adds proper
-per-page-fragment box paint.
+- `parse::Block` enum is the canonical block-level stream now. New
+  block-level features (videos, embeds, eventually tables) add
+  variants to `Block` rather than back-doors through `Paragraph`.
+- `style::BlockStyle::width_em` / `height_em` are present but only
+  consumed by `<img>` today. Tables (Phase 2c) and any future
+  fixed-width container will read the same fields — no cascade
+  changes needed.
+- Image data URLs are decoded via krilla's own decoders
+  (`Image::from_png`, `Image::from_jpeg`); no `image` crate
+  dependency. WebP/GIF would only need `from_webp`/`from_gif`
+  arms in `place_image_block` and corresponding MIME entries in
+  `image::parse_data_url`.
+- Percentage (`%`) widths/heights on `<img>` are explicitly dropped
+  by the cascade. A future `enum Length { Em, Percent }` upgrade
+  unblocks them globally.
 
 ## Phase 1.6 parallel-sprint pattern (proven, repeat for 1.7)
 
