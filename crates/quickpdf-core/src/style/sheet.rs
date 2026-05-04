@@ -36,6 +36,34 @@ pub struct Declaration {
     pub important: bool,
 }
 
+/// One `@font-face` block captured from author CSS. Phase 2b's font
+/// registry walks these to register web fonts; the registry parses
+/// the `font-family` and `src` descriptors itself.
+///
+/// `declarations` includes every declaration inside the block, normalised
+/// the same way qualified-rule declarations are: comments stripped,
+/// shorthand expanded, `!important` flag honoured. Non-`font-family` /
+/// non-`src` descriptors (e.g. `font-weight`, `unicode-range`) are
+/// preserved for forward compatibility but ignored by Phase 2b.
+#[derive(Debug, Clone)]
+pub struct FontFace {
+    pub declarations: Vec<Declaration>,
+    /// Source order across the full stylesheet (shared numbering with
+    /// `Rule.source_order`). Used by the registry for last-wins
+    /// disambiguation when two `@font-face` blocks declare the same
+    /// family name.
+    pub source_order: usize,
+}
+
+/// Parsed stylesheet: qualified rules and `@font-face` blocks. Other
+/// at-rules (`@media`, `@import`, `@keyframes`, …) are still dropped
+/// silently by `skip_at_rule`.
+#[derive(Debug, Clone, Default)]
+pub struct Stylesheet {
+    pub rules: Vec<Rule>,
+    pub font_faces: Vec<FontFace>,
+}
+
 /// Parse the body of an inline `style="..."` attribute into a flat list of
 /// declarations. Behaves identically to a `<style>` block's body: comments
 /// are stripped, declarations are split on top-level `;`, and `!important`
