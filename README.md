@@ -2,36 +2,45 @@
 
 Native Rust HTML→PDF rendering for Python. Fast preview, fast bulk, no Chromium.
 
-> **Status: Phase 1 in progress.** HTML parsing + bundled fallback font + naive
-> text emission are wired end-to-end. Real layout (block, inline, line
-> breaking, tables) is the next chunk of work. See
-> `~/.claude/plans/cheerful-riding-castle.md` for the full plan.
+> **Status: Phase 2 in progress** (2a images and 2b web fonts shipped; 2c tables
+> next). 233 Rust unit tests + 55 Python integration tests, all green.
 >
 > What works today:
 > - `quickpdf.html_to_pdf(html)` returns a valid PDF that paints the visible
->   text content of the input HTML in the embedded Inter font.
-> - Word-wrap at the page width using skrifa-measured glyph advances.
-> - Block-level elements (`<p>`, `<h1>`-`<h6>`, `<ul>`/`<li>`, `<div>`, …)
->   render as separate paragraphs with vertical gaps between them.
-> - Multi-page output: content that overflows the bottom margin flows onto
->   a new page automatically.
-> - **UA-default styling**: headings render at h1=2em … h6=0.67em, list items
->   are indented, paragraph margins follow CSS defaults.
-> - **Inline `<style>` cascade**: author rules override UA defaults. Selectors:
->   tag, `.class`, `#id`, descendant combinator. Properties: `font-size`
->   (px/pt/em/%), `font-weight`, `margin-top`/`-bottom`, `text-align`.
->   Last-declaration-wins; full specificity is Phase 1.6c.
-> - `<script>` / `<style>` / `<head>` content is correctly excluded from output;
->   `<style>` content is parsed for the cascade.
-> - Whitespace runs collapse the way browsers render them.
+>   text content of the input HTML.
+> - Block layout: paragraphs, headings, lists, mixed-content containers stack
+>   vertically with CSS-spec margins; content that overflows the bottom margin
+>   flows onto a new page.
+> - Word-wrap at the page width using skrifa-measured glyph advances; whitespace
+>   runs collapse the way browsers render them.
+> - **Full author-CSS cascade** with specificity (4-tuple), `!important`,
+>   inheritance via parent-chain walk, anonymous-block wrapping for orphan text,
+>   inline `style="..."` attributes (winning over selector rules), and `rem`
+>   unit support. Selectors: tag, `.class`, `#id`, descendant combinator.
+> - **Box model**: `color`, `background-color`, `padding-*`, `border-*`,
+>   `margin-*`, `font-size`, `font-weight`, `text-align`, `width`/`height`
+>   longhands; `padding` / `margin` / `border` shorthands expand to their
+>   longhands.
+> - **Block-level images** (`<img>`): PNG and JPEG embedded as `data:` URLs,
+>   with HTML `width`/`height` attrs, CSS `width`/`height`, paint-as-unit
+>   pagination, oversize proportional shrink, and `alt` fallback when the
+>   src can't be decoded.
+> - **Web fonts via `@font-face`**: declare a font with
+>   `src: url(data:font/ttf;base64,...)` (or `font/otf`; permissive MIME
+>   accept list with magic-byte sniff), then use `font-family: <name>` on
+>   any block. Multi-`src` lists walk left-to-right; unsupported entries
+>   (HTTP, `local()`, WOFF/WOFF2) are skipped; unresolved families fall
+>   back silently to the bundled Inter.
+> - `<script>` / `<head>` content is excluded; `<style>` content is parsed.
 >
 > What does NOT work yet:
-> - Specificity, `!important`, inheritance (Phase 1.6c).
-> - External `<link rel="stylesheet">` and inline `style="..."` attribute.
-> - Bold/italic rendering (the bundled font is regular only — Phase 4 adds
->   weight/style variants; UA `bold` flag is recorded but no font swap yet).
-> - Colours, backgrounds, borders, padding (Phase 1.7).
-> - Tables, images, hyperlinks.
+> - Tables (`<table>`/`<tr>`/`<td>`) — Phase 2c.
+> - Bold/italic rendering. The bundled font is regular only; UA `bold` flag
+>   is recorded but no font swap yet (Phase 4 adds weight/style variants).
+> - Inline `<span>` styling within paragraphs (paragraph-level only today).
+> - WOFF / WOFF2 font sources, system-font probing, HTTP font fetching.
+> - External `<link rel="stylesheet">`.
+> - Flex / Grid (Phase 4), `@page` rules, hyperlinks.
 
 ## Why
 
@@ -95,9 +104,11 @@ print("OK", len(pdf), "bytes")
 |  1.5  |   ✓    | Block layout (paragraphs stack vertically) + multi-page     |
 | 1.6a  |   ✓    | UA stylesheet: heading sizes, list indent, block margins    |
 | 1.6b  |   ✓    | Inline `<style>` parsing + tag/class/id/descendant cascade  |
-| 1.6c  |        | Full cascade: specificity, inheritance, `!important`        |
-|  1.7  |        | Borders, padding, margin, colours                           |
-|   2   |        | Tables + images + web fonts → renders email-style HTML      |
+| 1.6c  |   ✓    | Full cascade: specificity, inheritance, `!important`        |
+|  1.7  |   ✓    | Colours, backgrounds, padding, borders, shorthands, `rem`   |
+|  2a   |   ✓    | Block-level `<img>` (PNG/JPEG via `data:` URL)              |
+|  2b   |   ✓    | Web fonts via `@font-face` (`data:font/ttf\|otf` URLs)      |
+|  2c   |   →    | Tables (`<table>`/`<tr>`/`<td>`) — proper 2D layout         |
 |   3   |        | `BulkSession`, Rayon parallelism, `pip install quickpdf`    |
 |   4   |        | Flex/Grid (taffy), `@page` rules, position abs/rel          |
 |   5   |        | Incremental relayout (template-aware bulk), broader CSS     |
