@@ -88,6 +88,14 @@ impl Document {
         sheet::parse_stylesheet(&sheet::collect_style_blocks(self))
     }
 
+    /// Phase 2b: parse the document's `<style>` blocks into the aggregate
+    /// stylesheet (qualified rules + `@font-face` blocks). New code
+    /// should prefer this over `user_stylesheet` because it surfaces
+    /// font-face data needed for the registry.
+    pub fn stylesheet(&self) -> sheet::Stylesheet {
+        sheet::parse_stylesheet_full(&sheet::collect_style_blocks(self))
+    }
+
     /// Resolve any `Block`'s element handle back to a live `ElementRef`.
     /// Returns `None` if the handle is stale (which shouldn't happen — the
     /// `Document` owns the tree — but we treat it defensively).
@@ -768,6 +776,33 @@ mod tests {
         assert_eq!(inline.len(), 1);
         assert_eq!(inline[0].1[0].name, "color");
         assert_eq!(inline[0].1[0].value, "red");
+    }
+
+    // ---- Phase 2b Slice A: Document::stylesheet() aggregate accessor. ----
+
+    #[test]
+    fn document_stylesheet_returns_aggregate_with_rules_and_empty_faces() {
+        let doc = Document::parse(
+            "<style>p { color: red; }</style><p>x</p>",
+        );
+        let sheet = doc.stylesheet();
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selector_text, "p");
+        // Phase 2b Slice A's @font-face stub returns no faces yet; Task 5
+        // lights up real capture and adds another assertion at that layer.
+        assert!(sheet.font_faces.is_empty());
+    }
+
+    #[test]
+    fn document_user_stylesheet_back_compat_still_works() {
+        // The existing rules-only accessor must continue to work so
+        // pre-2b callers (lib.rs) keep compiling.
+        let doc = Document::parse(
+            "<style>p { color: red; }</style><p>x</p>",
+        );
+        let rules = doc.user_stylesheet();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].selector_text, "p");
     }
 
     // ---- Phase 2a Slice B: <img> as a block-level element. ----
